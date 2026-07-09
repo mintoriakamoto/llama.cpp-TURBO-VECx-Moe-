@@ -28,6 +28,7 @@ What's in this branch (all opt-in, off by default):
 | Residency planner — split a VRAM budget between KV cache, staging ring, and resident weights; emits ready-to-use flags | `scripts/svmi-plan.py` |
 | Token-identity check — greedy diff (and optional perplexity) of streamed vs baseline output | `scripts/svmi-verify.sh` |
 | Benchmark harness + compressed-transport feasibility study | `scripts/svmi-bench.sh`, `scripts/svmi-entropy.py` |
+| BitSpec feasibility — acceptance rate of a low-bit resident self-draft (novel; see research notes) | `scripts/svmi-bitspec.py` |
 
 ```bash
 # 70B Q4_K_M on a 20 GB budget:
@@ -37,6 +38,9 @@ python3 scripts/svmi-plan.py model-70b-q4_k_m.gguf --vram-budget 19
 
 Full design, research report, and roadmap (offload-aware speculative decoding,
 entropy-coded transport, MoE expert paging): **[docs/svmi.md](docs/svmi.md)**.
+Novel techniques designed for this fork (BitSpec self-speculation, pipelined streaming
+GEMM, stream-once-serve-many, elastic residency, ...) with bandwidth math and honesty
+notes: **[docs/svmi-research.md](docs/svmi-research.md)**.
 
 Lineage: supersedes the `fable5/prefetch-experts` patches from
 [thecodacus/llama.cpp](https://github.com/thecodacus/llama.cpp) (pinning + MoE expert

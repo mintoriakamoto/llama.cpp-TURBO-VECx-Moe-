@@ -86,6 +86,10 @@ the transport is scheduled differently.
   without streaming and diffs the tokens (byte-identical expected), with an optional
   `--ppl-file` perplexity equality check. This is the executable form of the
   token-identity guarantee.
+- `scripts/svmi-bitspec.py` — go/no-go study for **BitSpec** (bit-plane self-speculative
+  decoding): measures how often a low-bit resident draft of the model's own weights
+  agrees with full precision at the token decision, i.e. the speculative acceptance rate.
+  See the research notes below.
 
 ## Measured expectations (honest numbers)
 
@@ -106,7 +110,7 @@ PCIe 4.0 x16 (~25 GB/s pinned):
 | --- | --- | --- |
 | 1 | pinned weight store, upload queues, staging ring, `--stream-weights` | **this branch** |
 | 2 | residency planner | **this branch** (`scripts/svmi-plan.py`) |
-| 3 | offload-aware speculative decoding (tree drafts verified per stream pass; resident hot set doubles as the draft) | next |
+| 3 | offload-aware speculative decoding — **BitSpec**: a low-bit resident copy of the model's own weights is the draft, verified per stream pass (validated: `scripts/svmi-bitspec.py`, see [svmi-research.md](svmi-research.md)) | next |
 | 4 | compressed transport: entropy-coded quantized blocks, GPU rANS decode fused with dequant (`scripts/svmi-entropy.py` decides go/no-go) | next |
 | 5 | paged KV with host spill on the same DMA engine | planned |
 | 6 | predictive MoE expert paging (router-logit lookahead) | planned |
@@ -253,3 +257,11 @@ host (tier 1/2)                          GPU (< 20 GB)
 - Performance numbers quoted from external work (SpecExec, Sequoia, DietGPU, ZipServ,
   PowerInfer, FlexGen) are theirs; numbers for this branch must be measured with
   `scripts/svmi-bench.sh` on real hardware.
+
+## Beyond the roadmap
+
+Novel techniques designed for this fork — bit-plane self-speculative decoding (BitSpec),
+pipelined streaming GEMM, stream-once-serve-many, elastic residency, draft-guided MoE
+prefetch, and residual-precision transport — are written up with bandwidth math, honesty
+notes, and build priorities in **[svmi-research.md](svmi-research.md)**. BitSpec ships a
+working offline validator (`scripts/svmi-bitspec.py`).
