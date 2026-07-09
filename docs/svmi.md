@@ -82,6 +82,10 @@ the transport is scheduled differently.
   ratio.
 - `scripts/svmi-bench.sh` — three-way llama-bench comparison: baseline vs pinned vs
   streamed, same settings, prints a summary table.
+- `scripts/svmi-verify.sh` — correctness gate: greedy-decodes the same prompt with and
+  without streaming and diffs the tokens (byte-identical expected), with an optional
+  `--ppl-file` perplexity equality check. This is the executable form of the
+  token-identity guarantee.
 
 ## Measured expectations (honest numbers)
 

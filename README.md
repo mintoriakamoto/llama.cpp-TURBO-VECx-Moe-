@@ -26,6 +26,7 @@ What's in this branch (all opt-in, off by default):
 | Weight streaming — uploads for upcoming layers are enqueued on dedicated queues (one per DMA copy engine) into a staging ring, overlapping PCIe transfers with compute; generalizes MoE expert prefetch to dense models | `--stream-weights N` |
 | Streamed decode — keep all matmuls on the GPU at any batch size instead of computing host-resident layers on the CPU | `--stream-decode` |
 | Residency planner — split a VRAM budget between KV cache, staging ring, and resident weights; emits ready-to-use flags | `scripts/svmi-plan.py` |
+| Token-identity check — greedy diff (and optional perplexity) of streamed vs baseline output | `scripts/svmi-verify.sh` |
 | Benchmark harness + compressed-transport feasibility study | `scripts/svmi-bench.sh`, `scripts/svmi-entropy.py` |
 
 ```bash
