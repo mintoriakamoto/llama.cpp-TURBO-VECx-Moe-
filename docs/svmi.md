@@ -91,6 +91,52 @@ the transport is scheduled differently.
   agrees with full precision at the token decision, i.e. the speculative acceptance rate.
   See the research notes below.
 
+## Consumer GPUs (6–12 GB): 1660 Ti, RTX 2080 / 2080 Ti, RTX 3060
+
+These are exactly the cards SVMI is built for — small VRAM, and (for the Turing trio)
+the PCIe 3.0 link that sets a lower streaming ceiling than the datacenter default. The
+planner knows them: `python3 scripts/svmi-plan.py model.gguf --gpu 2080ti` fills in the
+VRAM budget, the effective PCIe bandwidth, and the correct upload-queue count.
+
+| GPU | VRAM | Arch | PCIe link | eff. H2D (pinned) | H2D copy engines → `GGML_SCHED_STREAM_QUEUES` |
+| --- | ---: | --- | --- | ---: | --- |
+| GTX 1660 Ti | 6 GB | Turing (no tensor cores) | 3.0 x16 | ~12 GB/s | 1 |
+| RTX 2080 | 8 GB | Turing | 3.0 x16 | ~12 GB/s | 1 |
+| RTX 2080 Ti | 11 GB | Turing | 3.0 x16 | ~12 GB/s | 1 |
+| RTX 3060 | 12 GB | Ampere | 4.0 x16 | ~24 GB/s | 2 |
+
+Card-specific guidance:
+
+- **PCIe 3.0 halves the streaming ceiling.** The Turing trio streams at ~12 GB/s, so the
+  raw decode floor for a fully-streamed 70B is ~0.3 tok/s (vs ~0.6 on the 3060's PCIe
+  4.0). This makes the **stream-less** and **amortize** multipliers essential on these
+  cards, not optional: keep as much resident as VRAM allows, and use BitSpec-style
+  self-speculation (`scripts/svmi-bitspec.py`) to amortize each stream over many tokens.
+- **One copy engine on GeForce cards.** Consumer Turing exposes a single H2D DMA engine,
+  so a second upload queue just serializes with overhead — the planner emits
+  `export GGML_SCHED_STREAM_QUEUES=1` for these. The 3060 has two, so it keeps the
+  default of 2.
+- **1660 Ti has no tensor cores and slow FP16.** Flash attention and F16 KV run on the
+  slower non-tensor path; prefer `-ctk q8_0 -ctv q8_0` (already the planner default) and
+  expect attention compute, not streaming, to dominate at short context.
+- **What fits.** A 12 GB 3060 holds the resident hot set (embeddings + all attention +
+  the head/tail FFN layers) of a 70B Q4_K_M with room for a quantized KV cache, streaming
+  the middle FFN layers; a 6 GB 1660 Ti is better matched to 8B–34B resident-heavy
+  configs or to 70B only with an aggressive streamed fraction. Run the planner to see the
+  exact split and the honest decode floor for your budget.
+
+Quick start on these cards:
+
+```bash
+# RTX 2080 Ti (11 GB, PCIe 3.0): plan, then run with the printed flags
+python3 scripts/svmi-plan.py models/llama-70b-q4_k_m.gguf --gpu 2080ti
+export GGML_SCHED_STREAM_QUEUES=1        # single copy engine (planner reminds you)
+./build/bin/llama-cli -m models/llama-70b-q4_k_m.gguf <printed -ngl/-ot/--stream flags>
+
+# check the speculative-decoding upside for your PCIe generation
+python3 scripts/svmi-bitspec.py models/llama-70b-q4_k_m.gguf --gpu 2080ti
+```
+
 ## Measured expectations (honest numbers)
 
 Per-token decode cost when streaming: `bytes_streamed / effective_PCIe_bandwidth`.

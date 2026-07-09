@@ -11,8 +11,14 @@
 #                         [-p 2048] [-n 32] [-r 3] [extra llama-bench args...]
 #
 # For a 70B-under-20GB run, generate placement flags first:
-#   python3 scripts/svmi-plan.py model.gguf --vram-budget 19
+#   python3 scripts/svmi-plan.py model.gguf --gpu 3060      # or 2080ti / 2080 / 1660ti
+#
+# On PCIe 3.0 consumer cards (GTX 1660 Ti, RTX 2080 / 2080 Ti) there is a single
+# H2D copy engine, so one upload queue is optimal; the streamed run below honors
+# GGML_SCHED_STREAM_QUEUES if you export it (the planner prints the right value).
 set -euo pipefail
+
+: "${GGML_SCHED_STREAM_QUEUES:=}"   # allow the caller/planner to pin the queue count
 
 BIN=${LLAMA_BENCH:-./build/bin/llama-bench}
 if [ ! -x "$BIN" ]; then
@@ -34,9 +40,14 @@ run() {
 
 ARGS=("$@")
 
+STREAM_ENV=(GGML_CUDA_REGISTER_HOST=1 GGML_SCHED_STREAM_WEIGHTS=8)
+if [ -n "${GGML_SCHED_STREAM_QUEUES}" ]; then
+    STREAM_ENV+=("GGML_SCHED_STREAM_QUEUES=${GGML_SCHED_STREAM_QUEUES}")
+fi
+
 run baseline env -u GGML_CUDA_REGISTER_HOST -u GGML_SCHED_STREAM_WEIGHTS
 run pinned   env GGML_CUDA_REGISTER_HOST=1
-run streamed env GGML_CUDA_REGISTER_HOST=1 GGML_SCHED_STREAM_WEIGHTS=8
+run streamed env "${STREAM_ENV[@]}"
 
 echo "=== summary (t/s columns) ==="
 for label in baseline pinned streamed; do

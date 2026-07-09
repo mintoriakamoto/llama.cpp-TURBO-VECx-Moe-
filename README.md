@@ -34,7 +34,14 @@ What's in this branch (all opt-in, off by default):
 # 70B Q4_K_M on a 20 GB budget:
 python3 scripts/svmi-plan.py model-70b-q4_k_m.gguf --vram-budget 19
 # ...then run the flags it prints
+
+# or target a specific consumer card (sets VRAM, PCIe bandwidth, and queue count):
+python3 scripts/svmi-plan.py model-70b-q4_k_m.gguf --gpu 3060     # also: 2080ti, 2080, 1660ti
 ```
+
+Tuned for small-VRAM consumer GPUs (GTX 1660 Ti, RTX 2080 / 2080 Ti, RTX 3060): the
+planner accounts for PCIe 3.0's lower streaming ceiling on Turing cards and their single
+H2D copy engine. See the [consumer-GPU guide](docs/svmi.md#consumer-gpus-612-gb-1660-ti-rtx-2080--2080-ti-rtx-3060).
 
 Full design, research report, and roadmap (offload-aware speculative decoding,
 entropy-coded transport, MoE expert paging): **[docs/svmi.md](docs/svmi.md)**.

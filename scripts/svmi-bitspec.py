@@ -92,7 +92,13 @@ def main() -> int:
     ap.add_argument("--bits", default="2,3,4", help="draft bit-widths to test (default 2,3,4)")
     ap.add_argument("--trials", type=int, default=512, help="number of hidden-state samples (default 512)")
     ap.add_argument("--topk", default="1,2,4,8", help="top-k containment levels to report (default 1,2,4,8)")
-    ap.add_argument("--pcie-gbps", type=float, default=25.0, help="effective PCIe H2D GB/s for the speedup model")
+    ap.add_argument("--pcie-gbps", type=float, default=None,
+                    help="effective PCIe H2D GB/s for the speedup model "
+                    "(default 24; PCIe 3.0 x16 cards like the 2080/2080Ti/1660Ti are ~12)")
+    ap.add_argument("--gpu", choices=["1660ti", "2060", "2070", "2080", "2080ti",
+                                      "3060", "3070", "3090", "4090"],
+                    help="preset that sets --pcie-gbps for a consumer GPU "
+                         "(Turing cards are PCIe 3.0 ~12 GB/s; Ampere+ ~24)")
     ap.add_argument("--model-gb", type=float, default=40.0, help="streamed weight size (GiB) for the speedup model")
     ap.add_argument("--draft-len", type=int, default=8, help="max drafted tokens per verification pass (default 8)")
     ap.add_argument("--seed", type=int, default=1234)
@@ -100,6 +106,10 @@ def main() -> int:
 
     bits_list = [int(b) for b in args.bits.split(",") if b.strip()]
     topk_list = sorted(int(k) for k in args.topk.split(",") if k.strip())
+    if args.pcie_gbps is None:
+        # Turing consumer cards are PCIe 3.0 (~12 GB/s pinned); everything else defaults to 24
+        pcie3 = {"1660ti", "2060", "2070", "2080", "2080ti"}
+        args.pcie_gbps = 12.0 if args.gpu in pcie3 else 24.0
     rng = np.random.default_rng(args.seed)
 
     reader = GGUFReader(args.model)
