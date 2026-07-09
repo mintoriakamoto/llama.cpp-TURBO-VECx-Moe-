@@ -61,6 +61,18 @@ static std::initializer_list<enum llama_example> mmproj_examples = {
     LLAMA_EXAMPLE_CLI,
 };
 
+// set an environment variable unless the user already set it explicitly
+static void common_env_set_default(const char * name, const std::string & value) {
+    if (getenv(name) != nullptr) {
+        return;
+    }
+#if defined(_WIN32)
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 0);
+#endif
+}
+
 static std::string read_file(const std::string & fname) {
     std::ifstream file(fname);
     if (!file) {
@@ -2651,6 +2663,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.no_op_offload = !value;
         }
     ));
+    add_opt(common_arg(
+        {"--stream-weights"}, "N",
+        "SVMI weight streaming: pin host-resident weights and upload them to the device "
+        "through N staging slots ahead of compute, overlapping PCIe transfers with kernels "
+        "(1 = default slot count, 0 = disabled (default))",
+        [](common_params & params, int value) {
+            params.stream_weights = value;
+            if (value > 0) {
+                // read by the backend scheduler and the CUDA backend at initialization
+                common_env_set_default("GGML_SCHED_STREAM_WEIGHTS", std::to_string(value));
+                common_env_set_default("GGML_CUDA_REGISTER_HOST", "1");
+            }
+        }
+    ).set_env("LLAMA_ARG_STREAM_WEIGHTS"));
+    add_opt(common_arg(
+        {"--stream-decode"},
+        "with --stream-weights: also stream weights during single-token decode by forcing "
+        "device offload for every batch size, keeping all matrix math on the GPU "
+        "(PCIe-bound; mainly useful for models much larger than VRAM, default: disabled)",
+        [](common_params & params) {
+            params.stream_decode = true;
+            common_env_set_default("GGML_OP_OFFLOAD_MIN_BATCH", "1");
+        }
+    ).set_env("LLAMA_ARG_STREAM_DECODE"));
     add_opt(common_arg(
         {"--lora"}, "FNAME",
         "path to LoRA adapter (use comma-separated values to load multiple adapters)",

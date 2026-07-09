@@ -761,6 +761,14 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+#ifndef GGML_SCHED_MAX_STREAM_SLOTS
+#define GGML_SCHED_MAX_STREAM_SLOTS 16
+#endif
+
+#ifndef GGML_SCHED_MAX_STREAM_QUEUES
+#define GGML_SCHED_MAX_STREAM_QUEUES 2
+#endif
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -817,6 +825,36 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+
+    // SVMI weight streaming (GGML_SCHED_STREAM_WEIGHTS):
+    // host-resident weights consumed by offloaded ops are uploaded ahead of time through
+    // dedicated upload queues (secondary backend instances = separate device streams) into a
+    // ring of staging slots, so PCIe transfers overlap compute instead of stalling it.
+    // generalizes the MUL_MAT_ID-only expert prefetch to any large matmul weight, which
+    // enables dense-model layer streaming in addition to MoE offload.
+    bool stream_weights;
+    int  stream_n_slots;
+    int  stream_n_queues;
+    int  stream_prefetch;               // how many splits ahead of compute to enqueue uploads
+    int  stream_backend_id;             // backend the streaming engine is bound to (-1 = not yet bound)
+    int  stream_scan_split;             // next split to scan for streamable weights (per eval)
+    int  stream_cur_slot;               // reset per eval so slot assignment is deterministic
+    int  stream_cur_queue;
+    ggml_backend_t        stream_queues[GGML_SCHED_MAX_STREAM_QUEUES];
+    ggml_backend_buffer_t stream_slots [GGML_SCHED_MAX_STREAM_SLOTS];
+    ggml_backend_event_t  stream_ready [GGML_SCHED_MAX_STREAM_SLOTS]; // upload finished
+    ggml_backend_event_t  stream_free  [GGML_SCHED_MAX_STREAM_SLOTS]; // last consumer finished
+    bool stream_used[GGML_SCHED_MAX_STREAM_SLOTS];                    // free event has been recorded
+    // uploads in flight: enqueued by the prefetch scan, consumed when their split computes;
+    // the staging copy points at a slot only while the upload is pending, the original
+    // buffer/data are restored as soon as the consuming split is launched
+    struct {
+        struct ggml_tensor *  input_cpy;
+        int                   slot;
+        ggml_backend_buffer_t saved_buffer;
+        void *                saved_data;
+    } stream_pending[GGML_SCHED_MAX_STREAM_SLOTS];
+    int stream_n_pending;
 
     int debug;
 
@@ -1538,9 +1576,286 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// SVMI weight streaming
+//
+// when weights live in host memory but their ops are offloaded to a device, the stock
+// path uploads each weight synchronously right before the split that consumes it, which
+// serializes PCIe transfer and compute. the streaming engine instead scans ahead of the
+// split being computed and enqueues the uploads early on dedicated upload queues
+// (secondary backend instances = independent device streams / DMA engines), so transfers
+// overlap compute. slots are recycled in a fixed ring; assignment is deterministic per
+// eval so kernel argument addresses repeat across evals (keeps CUDA graph replay valid).
+
+static void ggml_backend_sched_stream_restore_pending(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->stream_n_pending; i++) {
+        ggml_tensor * input_cpy = sched->stream_pending[i].input_cpy;
+        input_cpy->buffer = sched->stream_pending[i].saved_buffer;
+        input_cpy->data   = sched->stream_pending[i].saved_data;
+    }
+    sched->stream_n_pending = 0;
+}
+
+static void ggml_backend_sched_stream_disable(ggml_backend_sched_t sched) {
+    sched->stream_weights = false;
+    for (int q = 0; q < sched->stream_n_queues; q++) {
+        if (sched->stream_queues[q]) {
+            ggml_backend_synchronize(sched->stream_queues[q]);
+        }
+    }
+    if (sched->stream_backend_id != -1) {
+        ggml_backend_synchronize(sched->backends[sched->stream_backend_id]);
+    }
+    ggml_backend_sched_stream_restore_pending(sched);
+    for (int i = 0; i < sched->stream_n_slots; i++) {
+        ggml_backend_buffer_free(sched->stream_slots[i]);
+        sched->stream_slots[i] = NULL;
+        sched->stream_used[i] = false;
+    }
+}
+
+// whether this split input should go through the streaming engine, and the required slot size
+static size_t ggml_backend_sched_stream_input_size(const struct ggml_backend_sched_split * split,
+                                                   const struct ggml_tensor * input,
+                                                   const struct ggml_tensor * input_cpy) {
+    if (input->buffer == NULL ||
+        ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        !ggml_backend_buffer_is_host(input->buffer)) {
+        return 0;
+    }
+    // uploads smaller than this are cheaper through the regular path
+    const size_t min_stream_size = 1024*1024;
+    const size_t size = ggml_nbytes(input);
+    if (size < min_stream_size) {
+        return 0;
+    }
+    for (int i = 0; i < split->graph.n_nodes; i++) {
+        const ggml_tensor * node = split->graph.nodes[i];
+        if (node->src[0] != input_cpy) {
+            continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT) {
+            return size;
+        }
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            // with a large batch virtually every expert is used, so the routing ids are
+            // not worth waiting for and the full tensor is uploaded ahead of time;
+            // small batches keep the stock selective-expert copy which moves fewer bytes
+            const ggml_tensor * ids = node->src[2];
+            const int64_t n_expert = input->ne[2];
+            if (ids->ne[0]*ids->ne[1] >= 2*n_expert) {
+                return size;
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+// slots are sized once for the largest streamable weight in the current graph so they
+// never need to grow mid-eval
+static size_t ggml_backend_sched_stream_max_size(ggml_backend_sched_t sched, int backend_id) {
+    size_t max_size = 0;
+    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        struct ggml_backend_sched_split * split = &sched->splits[split_id];
+        if (split->backend_id != backend_id) {
+            continue;
+        }
+        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            struct ggml_tensor * input     = split->inputs[input_id];
+            struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+            max_size = std::max(max_size, ggml_backend_sched_stream_input_size(split, input, input_cpy));
+        }
+    }
+    return max_size;
+}
+
+static bool ggml_backend_sched_stream_init(ggml_backend_sched_t sched, int backend_id) {
+    ggml_backend_t backend = sched->backends[backend_id];
+
+    if (sched->stream_backend_id == -1) {
+        ggml_backend_dev_t dev = backend->device;
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        if (!props.caps.async || !props.caps.events) {
+            sched->stream_weights = false;
+            return false;
+        }
+        for (int q = 0; q < sched->stream_n_queues; q++) {
+            sched->stream_queues[q] = ggml_backend_dev_init(dev, NULL);
+            if (sched->stream_queues[q] == NULL) {
+                sched->stream_n_queues = q;
+                break;
+            }
+        }
+        if (sched->stream_n_queues == 0) {
+            sched->stream_weights = false;
+            return false;
+        }
+        for (int i = 0; i < sched->stream_n_slots; i++) {
+            sched->stream_ready[i] = ggml_backend_event_new(dev);
+            sched->stream_free[i]  = ggml_backend_event_new(dev);
+            if (sched->stream_ready[i] == NULL || sched->stream_free[i] == NULL) {
+                sched->stream_weights = false;
+                return false;
+            }
+        }
+        sched->stream_backend_id = backend_id;
+    }
+
+    if (sched->stream_backend_id != backend_id) {
+        // the engine is bound to a single device; splits on other devices use the stock path
+        return false;
+    }
+
+    const size_t size = ggml_backend_sched_stream_max_size(sched, backend_id);
+    if (size == 0) {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    for (int i = 0; i < sched->stream_n_slots; i++) {
+        if (sched->stream_slots[i] == NULL || ggml_backend_buffer_get_size(sched->stream_slots[i]) < size) {
+            // allocate before freeing so a failure leaves the old slot intact
+            ggml_backend_buffer_t new_buf = ggml_backend_buft_alloc_buffer(buft, size);
+            if (new_buf == NULL) {
+                // overlap needs at least 2 slots, otherwise run with what fits
+                if (i >= 2 && sched->stream_slots[0] != NULL &&
+                    ggml_backend_buffer_get_size(sched->stream_slots[0]) >= size) {
+                    sched->stream_n_slots = i;
+                    return true;
+                }
+                ggml_backend_sched_stream_disable(sched);
+                return false;
+            }
+            if (sched->stream_slots[i] != NULL) {
+                ggml_backend_synchronize(backend);
+                for (int q = 0; q < sched->stream_n_queues; q++) {
+                    ggml_backend_synchronize(sched->stream_queues[q]);
+                }
+                ggml_backend_buffer_free(sched->stream_slots[i]);
+            }
+            sched->stream_slots[i] = new_buf;
+            sched->stream_used[i] = false;
+        }
+    }
+    return true;
+}
+
+// enqueue uploads for streamable weights of upcoming splits; called before computing each
+// split, so uploads run ahead of compute by up to stream_prefetch splits (slot-bound)
+static void ggml_backend_sched_stream_scan(ggml_backend_sched_t sched, int cur_split) {
+    if (sched->stream_scan_split < cur_split) {
+        sched->stream_scan_split = cur_split;
+    }
+
+    while (sched->stream_scan_split < sched->n_splits &&
+           sched->stream_scan_split <= cur_split + sched->stream_prefetch) {
+        const int split_id = sched->stream_scan_split;
+        struct ggml_backend_sched_split * split = &sched->splits[split_id];
+
+        if (split->backend_id == sched->n_backends - 1) {
+            // CPU split: nothing to stream
+            sched->stream_scan_split++;
+            continue;
+        }
+
+        // count the streamable inputs first: a split is enqueued whole or not at all so
+        // that slot assignment stays deterministic across evals
+        int n_streamable = 0;
+        size_t split_max_size = 0;
+        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            struct ggml_tensor * input     = split->inputs[input_id];
+            struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+            const size_t size = ggml_backend_sched_stream_input_size(split, input, input_cpy);
+            if (size > 0) {
+                n_streamable++;
+                split_max_size = std::max(split_max_size, size);
+            }
+        }
+        if (n_streamable == 0) {
+            sched->stream_scan_split++;
+            continue;
+        }
+
+        // (re-)initialize the slots if missing or too small; init sizes them for the
+        // largest streamable weight of the whole graph, so within one eval this can only
+        // trigger on the first streamable split, never while uploads are in flight
+        if (sched->stream_backend_id == -1 || sched->stream_slots[0] == NULL ||
+            ggml_backend_buffer_get_size(sched->stream_slots[0]) < split_max_size) {
+            if (!ggml_backend_sched_stream_init(sched, split->backend_id)) {
+                return;
+            }
+        }
+        if (split->backend_id != sched->stream_backend_id) {
+            sched->stream_scan_split++;
+            continue;
+        }
+        if (sched->stream_n_pending + n_streamable > sched->stream_n_slots) {
+            // not enough free slots yet, retry once earlier splits consume theirs
+            return;
+        }
+
+        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            struct ggml_tensor * input     = split->inputs[input_id];
+            struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+            if (ggml_backend_sched_stream_input_size(split, input, input_cpy) == 0) {
+                continue;
+            }
+
+            // skip if this exact copy is already in flight (same weight consumed by two splits)
+            bool already_pending = false;
+            for (int i = 0; i < sched->stream_n_pending; i++) {
+                if (sched->stream_pending[i].input_cpy == input_cpy) {
+                    already_pending = true;
+                    break;
+                }
+            }
+            if (already_pending) {
+                continue;
+            }
+
+            const int slot = sched->stream_cur_slot;
+            sched->stream_cur_slot = (sched->stream_cur_slot + 1) % sched->stream_n_slots;
+            const int queue = sched->stream_cur_queue;
+            sched->stream_cur_queue = (sched->stream_cur_queue + 1) % sched->stream_n_queues;
+            ggml_backend_t upload_backend = sched->stream_queues[queue];
+
+            // wait (device-side) for the previous consumer of this slot to finish computing;
+            // the pending-count bound above guarantees the free event was already recorded
+            if (sched->stream_used[slot]) {
+                ggml_backend_event_wait(upload_backend, sched->stream_free[slot]);
+            }
+
+            // point the staging copy at the slot only until its split is launched, so a
+            // fallback to the regular path on a later eval can never see a slot pointer
+            auto & pending = sched->stream_pending[sched->stream_n_pending++];
+            pending.input_cpy    = input_cpy;
+            pending.slot         = slot;
+            pending.saved_buffer = input_cpy->buffer;
+            pending.saved_data   = input_cpy->data;
+
+            input_cpy->buffer = sched->stream_slots[slot];
+            input_cpy->data   = ggml_backend_buffer_get_base(sched->stream_slots[slot]);
+            ggml_backend_tensor_set_async(upload_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+            ggml_backend_event_record(sched->stream_ready[slot], upload_backend);
+        }
+
+        sched->stream_scan_split++;
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    const bool stream_weights = sched->stream_weights && !sched->callback_eval;
+    if (stream_weights) {
+        // deterministic per-eval state: for an unchanged graph every input copy maps to
+        // the same slot on every eval, which keeps captured kernel addresses stable
+        sched->stream_scan_split = 0;
+        sched->stream_cur_slot   = 0;
+        sched->stream_cur_queue  = 0;
+    }
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1551,11 +1866,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        if (stream_weights && sched->stream_weights) {
+            // enqueue uploads for upcoming splits so they overlap this split's compute
+            ggml_backend_sched_stream_scan(sched, split_id);
+        }
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+            // weights uploaded ahead of time by the streaming engine only need a
+            // device-side wait for the upload to finish
+            if (sched->stream_weights && sched->stream_n_pending > 0) {
+                bool is_pending = false;
+                for (int i = 0; i < sched->stream_n_pending; i++) {
+                    if (sched->stream_pending[i].input_cpy == input_cpy) {
+                        ggml_backend_event_wait(split_backend, sched->stream_ready[sched->stream_pending[i].slot]);
+                        is_pending = true;
+                        break;
+                    }
+                }
+                if (is_pending) {
+                    continue;
+                }
+            }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1676,7 +2012,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+
+            // finalize streamed weights consumed by this split: the kernels captured the
+            // slot addresses at launch, so the staging copies can be restored and the
+            // slots marked reusable once this split's compute finishes (free event)
+            if (sched->stream_weights && sched->stream_n_pending > 0) {
+                int n_remaining = 0;
+                for (int i = 0; i < sched->stream_n_pending; i++) {
+                    auto & pending = sched->stream_pending[i];
+                    bool consumed = false;
+                    for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                        if (pending.input_cpy == tensor_copy(split->inputs[input_id], split_backend_id, sched->cur_copy)) {
+                            consumed = true;
+                            break;
+                        }
+                    }
+                    if (consumed) {
+                        ggml_backend_event_record(sched->stream_free[pending.slot], split_backend);
+                        sched->stream_used[pending.slot] = true;
+                        pending.input_cpy->buffer = pending.saved_buffer;
+                        pending.input_cpy->data   = pending.saved_data;
+                    } else {
+                        sched->stream_pending[n_remaining++] = pending;
+                    }
+                }
+                sched->stream_n_pending = n_remaining;
+            }
+
             if (ec != GGML_STATUS_SUCCESS) {
+                // restore any staging copies still pointing at slots before bailing out
+                ggml_backend_sched_stream_restore_pending(sched);
                 return ec;
             }
         } else {
@@ -1720,6 +2085,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
     }
+
+    // every enqueued upload must have been consumed by the split that requested it
+    GGML_ASSERT(sched->stream_n_pending == 0);
 
     return GGML_STATUS_SUCCESS;
 }
@@ -1788,6 +2156,31 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
 
+    // SVMI weight streaming configuration:
+    //   GGML_SCHED_STREAM_WEIGHTS=1 enables it with the default slot count, >1 sets the
+    //   slot count directly; more slots let uploads run further ahead of compute at the
+    //   cost of one max-sized weight tensor of device memory per slot.
+    //   GGML_SCHED_STREAM_QUEUES sets the number of upload queues (default 2, one per
+    //   DMA copy engine on most discrete GPUs).
+    //   GGML_SCHED_STREAM_PREFETCH sets how many splits ahead of compute to enqueue
+    //   uploads (default 4, slot-bound).
+    //   GGML_SCHED_PREFETCH_EXPERTS=1 is accepted as a compatibility alias.
+    {
+        const char * env_stream   = getenv("GGML_SCHED_STREAM_WEIGHTS");
+        const char * env_experts  = getenv("GGML_SCHED_PREFETCH_EXPERTS");
+        const char * env_queues   = getenv("GGML_SCHED_STREAM_QUEUES");
+        const char * env_prefetch = getenv("GGML_SCHED_STREAM_PREFETCH");
+
+        int n_slots = env_stream ? atoi(env_stream) : (env_experts ? atoi(env_experts) : 0);
+        sched->stream_weights = op_offload && n_slots > 0;
+        // default of 8 covers the weight tensors of one dense layer plus lookahead into
+        // the next, or the gate/up/down expert tensors of two MoE layers
+        sched->stream_n_slots  = n_slots <= 1 ? 8 : std::min(n_slots, GGML_SCHED_MAX_STREAM_SLOTS);
+        sched->stream_n_queues = env_queues ? std::max(1, std::min(atoi(env_queues), GGML_SCHED_MAX_STREAM_QUEUES)) : GGML_SCHED_MAX_STREAM_QUEUES;
+        sched->stream_prefetch = env_prefetch ? std::max(1, atoi(env_prefetch)) : 4;
+        sched->stream_backend_id = -1;
+    }
+
     ggml_backend_sched_reset(sched);
 
     return sched;
@@ -1800,6 +2193,22 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
+        }
+    }
+    if (sched->stream_backend_id != -1) {
+        for (int q = 0; q < sched->stream_n_queues; q++) {
+            if (sched->stream_queues[q]) {
+                ggml_backend_synchronize(sched->stream_queues[q]);
+            }
+        }
+        // the slot count may have been reduced after a failed allocation, free everything
+        for (int i = 0; i < GGML_SCHED_MAX_STREAM_SLOTS; i++) {
+            ggml_backend_event_free(sched->stream_ready[i]);
+            ggml_backend_event_free(sched->stream_free[i]);
+            ggml_backend_buffer_free(sched->stream_slots[i]);
+        }
+        for (int q = 0; q < sched->stream_n_queues; q++) {
+            ggml_backend_free(sched->stream_queues[q]);
         }
     }
     ggml_gallocr_free(sched->galloc);
@@ -1905,6 +2314,11 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+    }
+    for (int q = 0; q < sched->stream_n_queues; q++) {
+        if (sched->stream_queues[q]) {
+            ggml_backend_synchronize(sched->stream_queues[q]);
+        }
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
