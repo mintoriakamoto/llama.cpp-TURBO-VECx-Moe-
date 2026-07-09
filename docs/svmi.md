@@ -58,8 +58,8 @@ SVMI replaces both:
 
 | Flag / env | Effect |
 | --- | --- |
-| `--stream-weights N` | enable streaming with `N` staging slots (1 = default of 8); also sets the two env vars below |
-| `--stream-decode` | force device offload at any batch size (sets `GGML_OP_OFFLOAD_MIN_BATCH=1`) |
+| `--stream-weights N` | enable streaming with `N` staging slots (1 = default of 8); also sets the two env vars below. Available in `llama-cli`, `llama-server`, and `llama-bench` |
+| `--stream-decode` | force device offload at any batch size (sets `GGML_OP_OFFLOAD_MIN_BATCH=1`). Available in `llama-cli`, `llama-server`, and `llama-bench` |
 | `GGML_SCHED_STREAM_WEIGHTS=N` | scheduler-level enable (what `--stream-weights` sets) |
 | `GGML_CUDA_REGISTER_HOST=1` | pin mmap'd host weights for fast DMA |
 | `GGML_SCHED_STREAM_QUEUES=N` | upload queues (default 2, one per DMA copy engine) |

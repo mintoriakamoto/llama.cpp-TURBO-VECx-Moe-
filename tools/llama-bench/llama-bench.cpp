@@ -41,6 +41,18 @@ static uint64_t get_time_ns() {
     return std::chrono::nanoseconds(clock::now().time_since_epoch()).count();
 }
 
+// set an environment variable unless the user already set it explicitly
+static void bench_env_set_default(const char * name, const std::string & value) {
+    if (getenv(name) != nullptr) {
+        return;
+    }
+#if defined(_WIN32)
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 0);
+#endif
+}
+
 static bool tensor_buft_override_equal(const llama_model_tensor_buft_override& a, const llama_model_tensor_buft_override& b) {
     if (a.pattern != b.pattern) {
         // cString comparison that may be null
@@ -423,6 +435,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --stream-weights <n>                        SVMI: stream host-resident weights through n staging slots (0 = off)\n");
+    printf("  --stream-decode                             SVMI: keep matmuls on device at every batch size (implies GPU offload for decode)\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -998,6 +1012,21 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.progress = true;
             } else if (arg == "--no-warmup") {
                 params.no_warmup = true;
+            } else if (arg == "--stream-weights") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                // SVMI weight streaming is configured through env vars read by the
+                // scheduler and CUDA backend at init; set them here (without overriding
+                // anything the user already exported) before any backend is created.
+                const int n = std::atoi(argv[i]);
+                if (n > 0) {
+                    bench_env_set_default("GGML_SCHED_STREAM_WEIGHTS", std::to_string(n));
+                    bench_env_set_default("GGML_CUDA_REGISTER_HOST", "1");
+                }
+            } else if (arg == "--stream-decode") {
+                bench_env_set_default("GGML_OP_OFFLOAD_MIN_BATCH", "1");
             } else if (arg == "-fitt" || arg == "--fit-target") {
                 if (++i >= argc) {
                     invalid_param = true;
