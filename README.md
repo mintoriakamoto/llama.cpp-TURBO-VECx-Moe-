@@ -12,6 +12,36 @@
 
 LLM inference in C/C++
 
+## This fork — llama.cpp TURBO-VECx-MoE (SVMI)
+
+This fork implements **SVMI (Streaming Virtual Memory Inference)**: the GPU is treated
+as a cache over a host-RAM weight store, so 70B-class models run in **under 20 GB of
+VRAM with all matrix math on the GPU** and token-identical output.
+
+What's in this branch (all opt-in, off by default):
+
+| Feature | Flag / env |
+| --- | --- |
+| Pinned host weight store — mmap'd weights are page-locked so H2D uploads run as real async DMA (~6–7 → ~20+ GB/s) | `GGML_CUDA_REGISTER_HOST=1` |
+| Weight streaming — uploads for upcoming layers are enqueued on dedicated queues (one per DMA copy engine) into a staging ring, overlapping PCIe transfers with compute; generalizes MoE expert prefetch to dense models | `--stream-weights N` |
+| Streamed decode — keep all matmuls on the GPU at any batch size instead of computing host-resident layers on the CPU | `--stream-decode` |
+| Residency planner — split a VRAM budget between KV cache, staging ring, and resident weights; emits ready-to-use flags | `scripts/svmi-plan.py` |
+| Benchmark harness + compressed-transport feasibility study | `scripts/svmi-bench.sh`, `scripts/svmi-entropy.py` |
+
+```bash
+# 70B Q4_K_M on a 20 GB budget:
+python3 scripts/svmi-plan.py model-70b-q4_k_m.gguf --vram-budget 19
+# ...then run the flags it prints
+```
+
+Full design, research report, and roadmap (offload-aware speculative decoding,
+entropy-coded transport, MoE expert paging): **[docs/svmi.md](docs/svmi.md)**.
+
+Lineage: supersedes the `fable5/prefetch-experts` patches from
+[thecodacus/llama.cpp](https://github.com/thecodacus/llama.cpp) (pinning + MoE expert
+prefetch, +64% prefill on an RTX 3060), rebased on current upstream master and
+generalized to dense-model streaming with multi-queue uploads.
+
 ## Recent API changes
 
 - [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
