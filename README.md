@@ -29,6 +29,7 @@ What's in this branch (all opt-in, off by default):
 | Token-identity check — greedy diff (and optional perplexity) of streamed vs baseline output | `scripts/svmi-verify.sh` |
 | Benchmark harness + compressed-transport feasibility study | `scripts/svmi-bench.sh`, `scripts/svmi-entropy.py` |
 | BitSpec feasibility — acceptance rate of a low-bit resident self-draft (novel; see research notes) | `scripts/svmi-bitspec.py` |
+| MAVM fleet planner — how many concurrent agents fit one GPU: shared weights (O(1) in agents), shared-prefix KV dedup, idle-KV spill, aggregate throughput | `scripts/svmi-fleet.py` |
 
 ```bash
 # 70B Q4_K_M on a 20 GB budget:
@@ -46,8 +47,8 @@ H2D copy engine. See the [consumer-GPU guide](docs/svmi.md#consumer-gpus-612-gb-
 Full design, research report, and roadmap (offload-aware speculative decoding,
 entropy-coded transport, MoE expert paging): **[docs/svmi.md](docs/svmi.md)**.
 Novel techniques designed for this fork (BitSpec self-speculation, pipelined streaming
-GEMM, stream-once-serve-many, elastic residency, ...) with bandwidth math and honesty
-notes: **[docs/svmi-research.md](docs/svmi-research.md)**.
+GEMM, stream-once-serve-many, elastic residency, MAVM multi-agent virtual memory, ...)
+with bandwidth math and honesty notes: **[docs/svmi-research.md](docs/svmi-research.md)**.
 
 Lineage: supersedes the `fable5/prefetch-experts` patches from
 [thecodacus/llama.cpp](https://github.com/thecodacus/llama.cpp) (pinning + MoE expert

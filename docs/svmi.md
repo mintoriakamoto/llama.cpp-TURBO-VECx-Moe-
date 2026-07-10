@@ -90,6 +90,12 @@ the transport is scheduled differently.
   decoding): measures how often a low-bit resident draft of the model's own weights
   agrees with full precision at the token decision, i.e. the speculative acceptance rate.
   See the research notes below.
+- `scripts/svmi-fleet.py` — multi-agent capacity planner for the **MAVM** design
+  (Multi-Agent Virtual Memory): given a GGUF and a GPU preset, tabulates how many
+  concurrent agents fit, the marginal VRAM of each additional agent (its unique KV
+  only — weights are shared), tokens saved by shared-prefix KV dedup, aggregate
+  fleet throughput under stream-once-serve-many + BitSpec, and the VRAM reclaimed
+  by spilling idle agents' KV to host.
 
 ## Consumer GPUs (6–12 GB): 1660 Ti, RTX 2080 / 2080 Ti, RTX 3060
 
@@ -308,6 +314,25 @@ host (tier 1/2)                          GPU (< 20 GB)
 
 Novel techniques designed for this fork — bit-plane self-speculative decoding (BitSpec),
 pipelined streaming GEMM, stream-once-serve-many, elastic residency, draft-guided MoE
-prefetch, and residual-precision transport — are written up with bandwidth math, honesty
-notes, and build priorities in **[svmi-research.md](svmi-research.md)**. BitSpec ships a
-working offline validator (`scripts/svmi-bitspec.py`).
+prefetch, residual-precision transport, and **MAVM** (Multi-Agent Virtual Memory: shared
+weights, shared-prefix KV dedup, fleet-clock batching, and idle-KV spill for agent
+fleets) — are written up with bandwidth math, honesty notes, and build priorities in
+**[svmi-research.md](svmi-research.md)**. Two ship working offline validators:
+`scripts/svmi-bitspec.py` (BitSpec) and `scripts/svmi-fleet.py` (MAVM).
+
+### Running many agents on one small GPU (MAVM in one command)
+
+```sh
+# 32 coding agents, 8K ctx each, 2K shared system prompt, on a 12 GB RTX 3060
+python3 scripts/svmi-fleet.py models/model-q4_k_m.gguf --gpu 3060 \
+    --agents 1,2,4,8,16,32 --ctx 8192 --shared-prompt 2048
+
+# no GGUF handy? plan a 70B fleet on a 2080 Ti from a synthetic profile
+python3 scripts/svmi-fleet.py --profile 70b --gpu 2080ti --agents 1,2,4,8 --ctx 4096
+```
+
+The report answers, per agent count: does the fleet fit; how much of the model stays
+resident vs streamed; the marginal VRAM of the next agent; prompt tokens saved by prefix
+dedup; and the aggregate decode rate in the streaming-bound region. The rule of thumb it
+encodes: **weights cost O(1) in agents, KV costs O(N), and idle agents should cost ~0** —
+their KV spills to host and the freed VRAM promotes streamed layers resident.

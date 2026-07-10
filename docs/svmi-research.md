@@ -6,10 +6,13 @@ mid-2026) and are not already covered by the SVMI roadmap in [`svmi.md`](svmi.md
 entry states the idea, why it is new, the bandwidth math, an honesty note on limits, and
 what to build. Everything is anchored to the SVMI axiom: for a model that does not fit in
 VRAM, decode latency is `bytes_streamed / PCIe_bandwidth`, and the only ways to beat it
-are **stream less**, **stream denser**, **amortize each stream**, or **hide the stream**.
+are **stream less**, **stream denser**, **amortize each stream**, or **hide the stream** —
+plus, for multi-agent fleets, a fifth axis: **share every stream and every byte across
+agents** (§7).
 
-One of these (BitSpec) ships with a working, GPU-free validator
-(`scripts/svmi-bitspec.py`); the measured result is below.
+Two of these ship with working, GPU-free validators: BitSpec
+(`scripts/svmi-bitspec.py`) and MAVM (`scripts/svmi-fleet.py`); measured results are
+inline.
 
 ---
 
@@ -149,6 +152,67 @@ negative-result candidate — the kind of idea worth *disproving* cheaply before
 
 ---
 
+## 7. MAVM — Multi-Agent Virtual Memory  *(share everything, once)*
+
+**Problem.** Agentic workloads don't run one sequence — they run a *fleet*: a planner, a
+coder, a reviewer, tool-callers, all hitting the same model concurrently, mostly sharing a
+system prompt, and mostly *idle* while they wait on tools or each other. Provisioning each
+agent as if it were a standalone deployment (its own model copy, its own full-context KV,
+its own prefill of the shared prompt) wastes VRAM, tokens, and time in direct proportion
+to the fleet size.
+
+**Idea.** Treat the SVMI substrate — resident weights, streaming ring, KV pool — as a
+single **virtual memory system shared by all agents**, with four mechanisms:
+
+1. **Shared weights, once.** All agents run against one resident hot set and one streaming
+   ring. The marginal VRAM cost of an additional agent is *only its unique KV* — for a
+   7B-class model at 8K context that is tens of MiB, not gigabytes. Weight VRAM is
+   `O(1)` in the number of agents instead of `O(N)`.
+2. **Prefix KV dedup (copy-on-write).** Agents sharing a system prompt share the KV pages
+   for that prefix; a page is copied only when an agent's sequence diverges. This is exact
+   (same tokens ⇒ same KV) and cuts both VRAM *and* token work: the shared prompt is
+   prefilled **once** for the whole fleet, saving `(N−1) × prefix_tokens` of prompt
+   processing — at 32 agents with a 2K shared prompt, ~86 % of the fleet's total token
+   work disappears.
+3. **Stream-once-serve-many as the fleet clock (§3).** Active agents decode in lock-step
+   on the shared layer-streaming schedule, so one PCIe pass over the streamed weights
+   serves the whole batch. Aggregate throughput scales with the number of *active* agents
+   until compute, not PCIe, becomes the bottleneck; combined with BitSpec (§1) the
+   streaming-bound region compounds to `passes/s × N_active × E[tokens]`.
+4. **Idle-aware KV spill (elastic residency for sequences).** An agent blocked on a tool
+   call contributes nothing but occupies KV. MAVM demotes idle agents' unique KV to pinned
+   host RAM and uses the freed VRAM to either admit more active agents or promote streamed
+   layers resident (faster decode for everyone). On wake, the KV pages back in behind the
+   first layer's compute — the same latency-hiding trick SVMI already plays with weights.
+   The GPU never idles on behalf of an idle agent.
+
+**Why it's different.** Serving stacks (vLLM, SGLang) share prefixes and batch requests,
+but they assume the *weights fit in VRAM*. MAVM's contribution is doing this on top of a
+**streamed** model: the weight-streaming clock becomes the batching mechanism (not an
+obstacle), and residency is arbitraged *across* weights and KV — idle KV is demoted so hot
+weights can be promoted, which no fits-in-VRAM server needs to consider.
+
+**Token identity.** Preserved throughout: shared weights are the same weights; shared
+prefix KV is bit-identical to recomputed KV; batching and spill change scheduling, not
+math; BitSpec verifies exactly.
+
+**Validation.** `scripts/svmi-fleet.py` implements the capacity/throughput/cost model,
+reading real GGUF dimensions (or `--profile 7b/8b/13b/70b` synthetic shapes). Two
+headline runs:
+
+* **RTX 3060, 0.5B model, 8K ctx, 2K shared prompt** — 32 agents fit in 11 GiB with
+  weights fully resident; the marginal agent costs 0.037 GiB (~13× more agents/GiB than
+  naive per-agent deployment); prefix dedup saves 63,488 prompt tokens (86 % of the
+  fleet's token work).
+* **RTX 2080 Ti, 70B Q4_K_M profile, 4K ctx, 1K shared prompt** — 8 agents fit in
+  10 GiB usable (marginal agent: 0.498 GiB vs 40.26 GiB naive, ~81× denser); the
+  streaming-bound model gives ~2.4 tok/s for one agent (0.35 raw floor × BitSpec) and
+  ~17 tok/s aggregate at 8 agents, because one PCIe pass serves the whole batch.
+
+The same tool shows the break-point where KV forces weight streaming or host spill.
+
+---
+
 ## Composition and priority
 
 The multipliers stack: `throughput ≈ base_tps × E[tokens] (BitSpec) × N (serve-many)`,
@@ -160,8 +224,9 @@ Build priority by expected payoff per unit of engineering risk:
 2. **Elastic residency (§4)** — cheap, safe, immediate; pure host-side scheduler logic.
 3. **Stream-once-serve-many (§3)** — high value for `llama-server` deployments.
 4. **Pipelined streaming GEMM (§2)** — solid prefill/tail win; needs a tiling-aware kernel.
-5. **Draft-guided MoE prefetch (§5)** — high value but MoE-only; depends on §1.
-6. **Residual-precision streaming (§6)** — validate-then-maybe; likely a documented negative.
+5. **MAVM (§7)** — the multiplier for agentic fleets; §3 + prefix dedup + KV spill composed into one substrate, planned with `svmi-fleet.py`.
+6. **Draft-guided MoE prefetch (§5)** — high value but MoE-only; depends on §1.
+7. **Residual-precision streaming (§6)** — validate-then-maybe; likely a documented negative.
 
-All six preserve token-identity (BitSpec/§5 via exact verification; the rest by
+All seven preserve token-identity (BitSpec/§5 via exact verification; the rest by
 construction), which keeps SVMI's core promise: same outputs, a fraction of the VRAM.
