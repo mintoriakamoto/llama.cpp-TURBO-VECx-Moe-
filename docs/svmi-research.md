@@ -8,11 +8,11 @@ what to build. Everything is anchored to the SVMI axiom: for a model that does n
 VRAM, decode latency is `bytes_streamed / PCIe_bandwidth`, and the only ways to beat it
 are **stream less**, **stream denser**, **amortize each stream**, or **hide the stream** —
 plus, for multi-agent fleets, a fifth axis: **share every stream and every byte across
-agents** (§7).
+agents** (§7), and for long context a sixth: **page the context itself** (§8).
 
-Two of these ship with working, GPU-free validators: BitSpec
-(`scripts/svmi-bitspec.py`) and MAVM (`scripts/svmi-fleet.py`); measured results are
-inline.
+Three of these ship with working, GPU-free validators: BitSpec
+(`scripts/svmi-bitspec.py`), and MAVM + CTX-VM (`scripts/svmi-fleet.py`); measured
+results are inline.
 
 ---
 
@@ -197,19 +197,72 @@ prefix KV is bit-identical to recomputed KV; batching and spill change schedulin
 math; BitSpec verifies exactly.
 
 **Validation.** `scripts/svmi-fleet.py` implements the capacity/throughput/cost model,
-reading real GGUF dimensions (or `--profile 7b/8b/13b/70b` synthetic shapes). Two
-headline runs:
+reading real GGUF dimensions (or `--profile 7b/8b/13b/70b` synthetic shapes). At long
+context MAVM composes with CTX-VM (§8); headline runs are listed there.
 
-* **RTX 3060, 0.5B model, 8K ctx, 2K shared prompt** — 32 agents fit in 11 GiB with
-  weights fully resident; the marginal agent costs 0.037 GiB (~13× more agents/GiB than
-  naive per-agent deployment); prefix dedup saves 63,488 prompt tokens (86 % of the
-  fleet's token work).
-* **RTX 2080 Ti, 70B Q4_K_M profile, 4K ctx, 1K shared prompt** — 8 agents fit in
-  10 GiB usable (marginal agent: 0.498 GiB vs 40.26 GiB naive, ~81× denser); the
-  streaming-bound model gives ~2.4 tok/s for one agent (0.35 raw floor × BitSpec) and
-  ~17 tok/s aggregate at 8 agents, because one PCIe pass serves the whole batch.
+---
 
-The same tool shows the break-point where KV forces weight streaming or host spill.
+## 8. CTX-VM — paged context virtual memory  *(share + stream the context itself)*
+
+**Problem.** MAVM alone dies at real context lengths. A 70B GQA model's KV cache costs
+~170 KiB/token (q8_0, all 80 layers): at 131,072 tokens that is **21 GiB per agent**, at
+262,144 tokens **43 GiB** — more than the weights, and per agent. No amount of weight
+streaming rescues a fleet whose *context* doesn't fit. Deep KV quant only divides by ~2–4;
+the growth is linear in ctx and in agents.
+
+**Idea.** Apply the SVMI move — virtual memory with a hot working set — to the KV cache:
+
+1. **Cold tier (pinned host RAM).** The full KV for every agent lives in pinned host
+   memory (optionally deeper-quantized, e.g. q4_0 cold vs q8_0 hot), DMA-reachable on the
+   same upload queues as streamed weights. VRAM stops scaling with context length.
+2. **Page table in VRAM (landmarks).** KV is chunked into fixed pages (default 256
+   tokens). Per page, per layer, per KV head, a small **key landmark** (f16 summary
+   vector) stays resident — ~160 KiB per page for a 70B, i.e. **80 MiB** of VRAM indexes
+   131K tokens whose full KV is 21 GiB. Each decode step scores the query against
+   landmarks to rank pages — the attention analogue of a TLB.
+3. **Hot window (VRAM).** Attention sinks + the local window + the top-ranked hot pages
+   stay resident (default 4,096 tokens ≈ 0.66 GiB for a 70B). Missed pages are fetched on
+   demand; with temporal locality of attention, misses are a few hundred tokens' worth per
+   step (~85 MB for a 70B at q4 cold — small next to the 30+ GiB weight pass it rides
+   along with).
+4. **Shared pages are fleet-global.** A 98K-token shared corpus is one set of cold pages
+   and one set of landmarks for the whole fleet, composing directly with §7's prefix
+   dedup: per-agent cost is only the *unique* context.
+
+Per-agent VRAM drops from `O(ctx)` to `O(window + ctx / page_size)` — 8–30× smaller at
+131K–256K in the runs below — and per-agent host RAM becomes the scaling wall, which is
+the cheap resource ($/GiB roughly 20× below VRAM).
+
+**Why it's different.** Paged KV (vLLM's PagedAttention) manages VRAM fragmentation, not
+capacity — pages stay in VRAM. Offload engines that spill KV to host read it back
+wholesale, paying full-context PCIe per token. Quest/InfLLM-style top-k attention selects
+pages but keeps everything in VRAM. CTX-VM combines the three: host-resident capacity,
+landmark-directed *selective* fetch, and integration with the weight-streaming clock so
+KV fetches share the DMA engines and the batching schedule that SVMI already runs.
+
+**Honesty note — token identity.** Landmark-directed page selection is the one mechanism
+in this document that is **approximate by default**: if a relevant page is not fetched,
+attention differs from the dense result. Two exact modes exist at a bandwidth price:
+(a) *exact scoring* — keep all keys resident at 2-bit (≈ 2.8 GiB for 70B @131K), score
+every token exactly, fetch only the values of the true top-k; (b) *BitSpec-style
+verification* — periodically recompute a step with dense attention and roll back on
+divergence. The planner models the default (approximate) mode; flag `--kv-fetch` upward
+to trade bandwidth for recall.
+
+**Validation** (`scripts/svmi-fleet.py`, analytical, real shapes):
+
+* **70B @131,072 ctx on RTX 3060 (12 GB), 96K shared corpus, q4 cold, 128 GiB host** —
+  **16 agents fit** (marginal agent: 0.35 GiB VRAM + 2.8 GiB host vs 61 GiB naive);
+  modeled ~61 tok/s aggregate, ~3.8 tok/s per agent in the streaming-bound region.
+* **70B @131,072 ctx on RTX 2080 Ti (11 GB), PCIe 3.0** — 8 agents fit; ~16 tok/s
+  aggregate.
+* **8B @262,144 ctx on RTX 3060** — 8 agents fit with weights fully resident (KV, not
+  weights, is the binding constraint; host RAM is the wall at 45 GiB).
+* **0.5B @131,072 ctx on GTX 1660 Ti (6 GB)** — **128 agents** fit; prefix dedup saves
+  16.7M prompt tokens at 256 agents.
+
+The `NO` rows in the planner output name the binding wall (VRAM vs host RAM) and the flag
+that moves it (`--kv-window`, `--cold-kv-type q4_0`, `--host-ram`).
 
 ---
 
@@ -225,8 +278,10 @@ Build priority by expected payoff per unit of engineering risk:
 3. **Stream-once-serve-many (§3)** — high value for `llama-server` deployments.
 4. **Pipelined streaming GEMM (§2)** — solid prefill/tail win; needs a tiling-aware kernel.
 5. **MAVM (§7)** — the multiplier for agentic fleets; §3 + prefix dedup + KV spill composed into one substrate, planned with `svmi-fleet.py`.
-6. **Draft-guided MoE prefetch (§5)** — high value but MoE-only; depends on §1.
-7. **Residual-precision streaming (§6)** — validate-then-maybe; likely a documented negative.
+6. **CTX-VM (§8)** — the prerequisite for 131K/256K context on consumer VRAM; extends §7, planned with the same tool.
+7. **Draft-guided MoE prefetch (§5)** — high value but MoE-only; depends on §1.
+8. **Residual-precision streaming (§6)** — validate-then-maybe; likely a documented negative.
 
-All seven preserve token-identity (BitSpec/§5 via exact verification; the rest by
-construction), which keeps SVMI's core promise: same outputs, a fraction of the VRAM.
+All preserve token-identity (BitSpec/§5 via exact verification, CTX-VM/§8 via its exact
+modes; the rest by construction), which keeps SVMI's core promise: same outputs, a
+fraction of the VRAM.

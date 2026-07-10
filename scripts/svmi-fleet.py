@@ -1,43 +1,45 @@
 #!/usr/bin/env python3
 """
-SVMI fleet planner — many agents on one GPU (MAVM capacity / throughput / cost model)
+SVMI fleet planner — many agents, long context, one GPU (MAVM + CTX-VM model)
 
-Answers the multi-agent question: on a single small-VRAM GPU, how many concurrent
-agents (sequences) can share one streamed model, what does each additional agent cost,
-and how fast does the fleet run? It quantifies the "Multi-Agent Virtual Memory" (MAVM)
-design from docs/svmi-research.md, mapping each goal to a number:
+Answers the multi-agent question at real context lengths (131072 / 262144 tokens):
+how many concurrent agents share one streamed model, what does each additional agent
+cost in VRAM *and* host RAM, and how fast does the fleet run?
 
-  * bigger models        -> weights streamed, only a resident hot set in VRAM
-  * more agents          -> weights are shared once; a new agent costs only its KV
-  * cheaper VRAM         -> shared-prefix KV is stored once for the whole fleet
-  * cheaper tokens       -> the shared system prompt is prefilled once, not per agent
-  * faster / no idle     -> stream-once-serve-many batches agents onto one PCIe pass,
-                            and idle agents' KV spills to host to free VRAM
-  * + speculation        -> BitSpec amortizes each streamed pass over many tokens
+It quantifies two designs from docs/svmi-research.md:
 
-Everything modeled here is token-identical: shared weights, shared-prefix KV
-(copy-on-write), batched streaming, KV spill, and speculative verification all produce
-the same tokens a single-agent full-VRAM run would.
+  MAVM  (§7)  weights shared once (O(1) in agents), shared-prefix KV dedup,
+              stream-once-serve-many batching, idle-KV spill.
+  CTX-VM (§8) paged context virtual memory: full KV lives in pinned host RAM,
+              a landmark page table + a hot window stay in VRAM, and missed
+              pages are demand-fetched over the same DMA path as weights.
+              This is what makes 131K–256K context per agent fit a consumer GPU:
+              per-agent VRAM drops from O(ctx) to O(window + ctx/page_size).
 
-Method: reads the real model dimensions from the GGUF (layers, heads, kv-heads, embd),
-then applies standard capacity/bandwidth formulas. Numbers are analytical estimates, not
-a substitute for measuring on hardware, but they are grounded in the actual model shape.
+Goal → mechanism map:
+  bigger models     -> weights streamed; only a hot set resident
+  more agents       -> new agent costs its hot KV window + page table, not 20+ GiB
+  131K/256K context -> CTX-VM paging (full KV would be 21-80 GiB/agent for a 70B)
+  cheaper VRAM      -> shared-prefix pages stored once fleet-wide
+  cheaper tokens    -> shared corpus prefilled once, not per agent
+  faster / no idle  -> batched streaming clock + BitSpec; idle agents' hot window
+                       spills to host so the GPU never idles on their behalf
+
+Numbers are analytical estimates grounded in the model's actual shape (read from the
+GGUF, or a synthetic profile); measure on hardware before believing decimals.
 
 Usage:
-  python3 scripts/svmi-fleet.py model.gguf --gpu 3060 \
-      --agents 1,2,4,8,16 --ctx 8192 --shared-prompt 2048 --gen 256
-  python3 scripts/svmi-fleet.py --profile 70b --gpu 2080ti --agents 1,2,4 --ctx 4096
+  python3 scripts/svmi-fleet.py --profile 70b --gpu 2080ti --agents 1,2,4,8 \
+      --ctx 131072 --shared-prompt 98304 --host-ram 128
+  python3 scripts/svmi-fleet.py model.gguf --gpu 3060 --agents 8,16,32 --ctx 262144
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "gguf-py"))
-
-from gguf import GGUFReader  # noqa: E402
 
 GiB = 1024**3
 
@@ -52,12 +54,12 @@ GPU_PRESETS = {
 KV_BPE = {"f16": 2.0, "q8_0": 1.0625, "q5_1": 0.75, "q4_0": 0.5625}
 
 # synthetic profiles (Q4_K_M-class weights) so a fleet can be planned without the GGUF:
-# (n_layer, n_embd, n_head, n_head_kv, total weight GiB, ffn frac, attn frac)
+# (n_layer, n_embd, n_head, n_head_kv, total weight GiB, streamable frac)
 MODEL_PROFILES = {
-    "7b":  (32, 4096, 32, 32,  3.9, 0.62, 0.30),
-    "8b":  (32, 4096, 32,  8,  4.6, 0.55, 0.22),
-    "13b": (40, 5120, 40, 40,  7.4, 0.63, 0.30),
-    "70b": (80, 8192, 64,  8, 39.6, 0.70, 0.25),
+    "7b":  (32, 4096, 32, 32,  3.9, 0.92),
+    "8b":  (32, 4096, 32,  8,  4.6, 0.77),
+    "13b": (40, 5120, 40, 40,  7.4, 0.93),
+    "70b": (80, 8192, 64,  8, 39.6, 0.95),
 }
 
 
@@ -71,17 +73,30 @@ def main() -> int:
     ap.add_argument("--pcie", choices=sorted(PCIE_BW), help="PCIe link (overrides --gpu)")
     ap.add_argument("--display-reserve", type=float, default=1.0)
     ap.add_argument("--agents", default="1,2,4,8,16,32", help="agent counts to tabulate")
-    ap.add_argument("--ctx", type=int, default=8192, help="per-agent context length")
+    ap.add_argument("--ctx", type=int, default=131072, help="per-agent context length")
     ap.add_argument("--shared-prompt", type=int, default=0,
-                    help="tokens of a system prompt shared by all agents (prefix KV dedup)")
-    ap.add_argument("--gen", type=int, default=256, help="tokens generated per agent (for cost model)")
-    ap.add_argument("--kv-type", choices=list(KV_BPE), default="q8_0")
+                    help="tokens of a corpus/system prompt shared by all agents (prefix KV dedup)")
+    ap.add_argument("--gen", type=int, default=1024, help="tokens generated per agent (for cost model)")
+    ap.add_argument("--kv-type", choices=list(KV_BPE), default="q8_0", help="hot (VRAM) KV quant")
+    ap.add_argument("--cold-kv-type", choices=list(KV_BPE), default=None,
+                    help="host-resident cold-page KV quant (default: same as --kv-type)")
+    ap.add_argument("--kv-mode", choices=["auto", "full", "paged"], default="auto",
+                    help="full: whole KV in VRAM; paged: CTX-VM demand paging; auto: paged "
+                         "when ctx > 16K or full per-agent KV exceeds 1.5 GiB")
+    ap.add_argument("--kv-window", type=int, default=4096,
+                    help="paged mode: hot KV tokens resident in VRAM per agent "
+                         "(attention sink + local window + hot-page cache)")
+    ap.add_argument("--page", type=int, default=256, help="paged mode: KV page size in tokens")
+    ap.add_argument("--kv-fetch", type=int, default=512,
+                    help="paged mode: mean missed-page KV tokens fetched from host per decode step")
+    ap.add_argument("--host-ram", type=float, default=64.0,
+                    help="pinned host RAM budget GiB (weights + cold KV pool)")
     ap.add_argument("--overhead", type=float, default=1.25, help="activation/compute reserve GiB")
     ap.add_argument("--stream-slots", type=int, default=8)
     ap.add_argument("--bitspec-tokens", type=float, default=7.0,
                     help="mean tokens accepted per streamed pass under BitSpec (see svmi-bitspec.py)")
     ap.add_argument("--idle-frac", type=float, default=0.5,
-                    help="fraction of agents idle at a given instant (KV spillable to host)")
+                    help="fraction of agents idle at a given instant (hot window spillable)")
     args = ap.parse_args()
 
     # resolve GPU
@@ -97,15 +112,17 @@ def main() -> int:
     pcie_bw = PCIE_BW[args.pcie or "4.0-x16"]
 
     if args.profile:
-        n_layer, n_embd, n_head, n_head_kv, w_gib, ffn_frac, attn_frac = MODEL_PROFILES[args.profile]
+        n_layer, n_embd, n_head, n_head_kv, w_gib, stream_frac = MODEL_PROFILES[args.profile]
         arch = f"profile:{args.profile}"
         model_name = f"{args.profile} (synthetic Q4_K_M-class)"
         total_w = int(w_gib * GiB)
-        ffn_bytes = int(total_w * ffn_frac)
-        attn_bytes = int(total_w * attn_frac)
-        # one FFN weight tensor ~ ffn bytes / (3 tensors per layer * layers)
-        max_stream_tensor = ffn_bytes // (3 * n_layer)
+        streamable_w = int(total_w * stream_frac)
+        # one streamable tensor ~ streamable bytes / (~7 matmul tensors per layer)
+        max_stream_tensor = streamable_w // (7 * n_layer)
     elif args.model:
+        sys.path.insert(0, str(Path(__file__).parent.parent / "gguf-py"))
+        from gguf import GGUFReader
+
         reader = GGUFReader(args.model)
 
         def fi(key: str, default: int = 0) -> int:
@@ -124,94 +141,127 @@ def main() -> int:
         model_name = Path(args.model).name
 
         total_w = sum(int(t.n_bytes) for t in reader.tensors)
-        ffn_bytes = sum(int(t.n_bytes) for t in reader.tensors if ".ffn_" in t.name)
-        attn_bytes = sum(int(t.n_bytes) for t in reader.tensors if ".attn_" in t.name)
+        streamable_w = sum(int(t.n_bytes) for t in reader.tensors
+                           if ".ffn_" in t.name or ".attn_" in t.name)
         max_stream_tensor = max((int(t.n_bytes) for t in reader.tensors
                                  if ".ffn_" in t.name or ".attn_" in t.name), default=0)
     else:
         ap.error("provide a GGUF path or --profile")
 
     head_dim = n_embd // n_head if n_head else 0
-    streamable_w = ffn_bytes + attn_bytes        # scheduler streams any big matmul weight
-    min_resident = total_w - streamable_w        # embeddings / norms / output head
+    min_resident = total_w - streamable_w      # embeddings / norms / output head
 
-    # KV bytes per token (whole model) and per agent
-    kv_per_tok = 2 * head_dim * n_head_kv * n_layer * KV_BPE[args.kv_type]
-    kv_shared = int(kv_per_tok * args.shared_prompt)          # stored once for the fleet
-    kv_unique = int(kv_per_tok * max(0, args.ctx - args.shared_prompt))  # per agent
+    hot_bpe  = KV_BPE[args.kv_type]
+    cold_bpe = KV_BPE[args.cold_kv_type or args.kv_type]
+    kv_tok_hot  = 2 * head_dim * n_head_kv * n_layer * hot_bpe    # bytes/token, all layers
+    kv_tok_cold = 2 * head_dim * n_head_kv * n_layer * cold_bpe
+
+    shared_ctx = min(args.shared_prompt, args.ctx)
+    unique_ctx = args.ctx - shared_ctx
+
+    full_kv_agent = int(kv_tok_hot * unique_ctx)   # full mode, per agent, VRAM
+    paged = args.kv_mode == "paged" or (
+        args.kv_mode == "auto" and (args.ctx > 16384 or full_kv_agent > 1.5 * GiB))
+
+    landmark_page = n_layer * n_head_kv * head_dim * 2            # one f16 key landmark/page
+    if paged:
+        window = min(args.kv_window, args.ctx)
+        pages_unique = math.ceil(unique_ctx / args.page)
+        pages_shared = math.ceil(shared_ctx / args.page)
+        kv_vram_agent  = int(window * kv_tok_hot) + pages_unique * landmark_page
+        kv_vram_shared = pages_shared * landmark_page             # landmarks only, stored once
+        kv_host_agent  = int(unique_ctx * kv_tok_cold)
+        kv_host_shared = int(shared_ctx * kv_tok_cold)
+        kv_fetch_bytes = int(args.kv_fetch * kv_tok_cold)         # per decode step per agent
+    else:
+        kv_vram_agent  = full_kv_agent
+        kv_vram_shared = int(kv_tok_hot * shared_ctx)
+        kv_host_agent = kv_host_shared = kv_fetch_bytes = 0
 
     ring = args.stream_slots * max_stream_tensor
     budget = int(args.vram_budget * GiB)
+    host_budget = int(args.host_ram * GiB)
     fixed = ring + int(args.overhead * GiB)
 
-    print(f"model        : {model_name} ({arch}, {n_layer} layers, {total_w/GiB:.2f} GiB)")
+    print(f"model        : {model_name} ({arch}, {n_layer} layers, {total_w/GiB:.2f} GiB, "
+          f"streamable {streamable_w/GiB:.2f})")
     if args.gpu:
-        print(f"gpu          : {args.gpu}  ({args.pcie}, {n_queues} H2D copy engine(s))")
-    print(f"vram budget  : {budget/GiB:.2f} GiB   |  streamable {streamable_w/GiB:.2f} / "
-          f"resident-min {min_resident/GiB:.2f} GiB")
-    print(f"kv/token     : {kv_per_tok/1024:.1f} KiB (whole model, {args.kv_type})   "
-          f"per-agent ctx {args.ctx} -> {kv_unique/GiB:.3f} GiB "
-          f"(+{kv_shared/GiB:.3f} GiB shared prefix)")
-    print(f"fixed reserve: ring {ring/GiB:.2f} + overhead {args.overhead:.2f} GiB\n")
+        print(f"gpu          : {args.gpu}  ({args.pcie}, {n_queues} H2D copy engine(s), "
+              f"{pcie_bw:.0f} GB/s eff)")
+    print(f"context      : {args.ctx:,} tok/agent ({shared_ctx:,} shared + {unique_ctx:,} unique), "
+          f"kv {args.kv_type}" + (f"/{args.cold_kv_type} cold" if args.cold_kv_type else ""))
+    print(f"kv mode      : {'CTX-VM paged' if paged else 'full-in-VRAM'}"
+          + (f"  (window {args.kv_window:,} tok, {args.page}-tok pages, "
+             f"~{args.kv_fetch} tok fetched/step)" if paged else ""))
+    if paged:
+        print(f"kv/agent     : VRAM {kv_vram_agent/GiB:.2f} GiB (vs {full_kv_agent/GiB:.1f} full "
+              f"-> {full_kv_agent/max(1,kv_vram_agent):.0f}x smaller) + host {kv_host_agent/GiB:.2f} GiB")
+    else:
+        print(f"kv/agent     : VRAM {kv_vram_agent/GiB:.2f} GiB")
+    print(f"vram/host    : budget {budget/GiB:.2f} GiB (ring {ring/GiB:.2f} + overhead "
+          f"{args.overhead:.2f} reserved)  |  host budget {args.host_ram:.0f} GiB "
+          f"(weights pinned: {total_w/GiB:.2f})\n")
 
-    print(f"{'agents':>6} {'resident W':>10} {'streamed W':>10} {'KV total':>9} "
-          f"{'fits?':>6} {'stream GiB/tok':>13} {'agg tok/s*':>10} {'per-agent':>9}")
+    print(f"{'agents':>6} {'resident W':>10} {'streamed W':>10} {'KV vram':>8} {'host RAM':>8} "
+          f"{'fits?':>6} {'agg tok/s*':>10} {'per-agent':>9}")
 
     agent_counts = [int(a) for a in args.agents.split(",") if a.strip()]
     max_fit = 0
     for n in agent_counts:
-        kv_total = kv_shared + n * kv_unique
-        avail_for_w = budget - fixed - kv_total
+        kv_vram = kv_vram_shared + n * kv_vram_agent
+        host = total_w + kv_host_shared + n * kv_host_agent
+        avail_for_w = budget - fixed - kv_vram
+        why = None
         if avail_for_w < min_resident:
-            print(f"{n:>6} {'—':>10} {'—':>10} {kv_total/GiB:8.2f}G {'NO':>6}  "
-                  f"(KV+reserve alone exceed budget; need KV spill or fewer agents)")
+            why = "VRAM: KV+reserve exceed budget"
+        elif host > host_budget:
+            why = f"host RAM: needs {host/GiB:.0f} GiB (raise --host-ram or --cold-kv-type q4_0)"
+        if why:
+            print(f"{n:>6} {'—':>10} {'—':>10} {kv_vram/GiB:7.2f}G {host/GiB:7.0f}G {'NO':>6}  ({why})")
             continue
         max_fit = n
-        # everything that fits stays resident; the remainder of the streamable set streams
         resident_w = min(total_w, avail_for_w)
         streamed_w = total_w - resident_w
-        # one batched streamed pass serves all n active agents (stream-once-serve-many)
-        stream_per_tok = streamed_w  # bytes moved per *pass*, shared across the batch
-        base_pass_per_s = pcie_bw * 1e9 / streamed_w if streamed_w else float("inf")
-        # aggregate decode tok/s ~ passes/s * agents batched * accepted tokens/pass (BitSpec)
-        if streamed_w == 0:
-            agg = float("inf")
-            per_agent = float("inf")
+        # one batched streamed pass serves all n agents; each accepted token also pays
+        # its agent's missed-page KV fetch on the same PCIe link
+        bytes_per_pass = streamed_w + n * args.bitspec_tokens * kv_fetch_bytes
+        if bytes_per_pass <= 0:
+            agg_s, per_s = "resident", "—"
         else:
-            agg = base_pass_per_s * n * args.bitspec_tokens
-            per_agent = agg / n
-        fits = "yes"
-        print(f"{n:>6} {resident_w/GiB:9.2f}G {streamed_w/GiB:9.2f}G {kv_total/GiB:8.2f}G "
-              f"{fits:>6} {stream_per_tok/GiB:12.3f}  "
-              f"{'resident' if streamed_w==0 else f'{agg:8.1f}'} "
-              f"{'—' if streamed_w==0 else f'{per_agent:8.1f}'}")
+            agg = pcie_bw * 1e9 / bytes_per_pass * n * args.bitspec_tokens
+            agg_s, per_s = f"{agg:8.1f}", f"{agg/n:8.1f}"
+        print(f"{n:>6} {resident_w/GiB:9.2f}G {streamed_w/GiB:9.2f}G {kv_vram/GiB:7.2f}G "
+              f"{host/GiB:7.0f}G {'yes':>6} {agg_s:>10} {per_s:>9}")
 
-    print("\n* aggregate decode tok/s across the whole fleet, streaming-bound region, with "
-          "stream-once-serve-many + BitSpec\n  (mean {:.0f} tokens/pass); it plateaus once "
-          "compute, not PCIe, becomes the bottleneck.".format(args.bitspec_tokens))
+    print("\n* aggregate decode tok/s, streaming-bound region: one PCIe pass over streamed "
+          "weights serves all agents\n  (stream-once-serve-many), x BitSpec mean "
+          f"{args.bitspec_tokens:.0f} tok/pass, minus paged-KV fetch traffic; plateaus when "
+          "compute binds.")
 
-    # marginal cost of one more agent, and the naive comparison
     print("\n-- economics --")
-    print(f"marginal VRAM per additional agent : {kv_unique/GiB:.3f} GiB (its unique KV only; "
-          f"weights are shared)")
-    naive_per_agent = (total_w + kv_shared + kv_unique) / GiB
-    print(f"naive (no sharing) per agent       : {naive_per_agent:.2f} GiB "
-          f"(full model copy each) -> MAVM is ~{naive_per_agent/(kv_unique/GiB):.0f}x denser in agents/GiB")
-
-    if args.shared_prompt > 0:
+    print(f"marginal agent : {kv_vram_agent/GiB:.2f} GiB VRAM + {kv_host_agent/GiB:.2f} GiB host "
+          f"(weights shared, O(1) in agents)")
+    naive = (total_w + kv_tok_hot * args.ctx) / GiB
+    print(f"naive per agent: {naive:.1f} GiB VRAM (own model copy + full-VRAM KV) -> "
+          f"{naive/max(1e-9, kv_vram_agent/GiB):.0f}x denser in agents/GiB of VRAM")
+    if shared_ctx > 0 and len(agent_counts) > 0:
         big = max(agent_counts)
-        print(f"prefix cache (shared prompt {args.shared_prompt} tok): prefilled once, not per "
-              f"agent -> saves {(big-1)*args.shared_prompt:,} prompt tokens at {big} agents "
-              f"({(big-1)*args.shared_prompt/max(1,big*(args.shared_prompt+args.gen)):.0%} of total token work)")
-
-    reclaim = args.idle_frac * kv_unique
-    print(f"idle reclamation: with {args.idle_frac:.0%} agents idle, spilling their KV frees "
-          f"{args.idle_frac:.0%} x per-agent KV each = {reclaim/GiB:.3f} GiB/idle-agent back to "
-          f"weights or new agents (no GPU idle: freed VRAM promotes streamed layers resident)")
-
+        saved = (big - 1) * shared_ctx
+        total_work = big * (args.ctx - shared_ctx + args.gen) + shared_ctx
+        print(f"prefix dedup   : {shared_ctx:,}-tok shared corpus prefilled once -> saves "
+              f"{saved:,} prompt tokens at {big} agents "
+              f"({saved/(saved+total_work):.0%} of fleet prefill+decode work)")
+    reclaim = args.idle_frac * (kv_vram_agent if paged else kv_vram_agent)
+    print(f"idle spill     : at {args.idle_frac:.0%} idle, each parked agent frees "
+          f"{kv_vram_agent/GiB:.2f} GiB VRAM (hot window + page table page out; "
+          f"wake-up hides behind the first layers' compute)")
     if max_fit:
-        print(f"\nverdict: up to ~{max_fit} concurrent agents fit this budget at ctx {args.ctx}; "
-              f"beyond that, enable KV host-spill (--idle-frac) or raise the shared-prompt fraction.")
+        print(f"\nverdict: ~{max_fit} concurrent agents at ctx {args.ctx:,} on this budget"
+              + ("; scale further with --cold-kv-type q4_0, a smaller --kv-window, "
+                 "or more --host-ram." if paged else "."))
+    else:
+        print("\nverdict: 0 agents fit — switch --kv-mode paged, shrink --kv-window, or use "
+              "--cold-kv-type q4_0.")
     return 0
 
 

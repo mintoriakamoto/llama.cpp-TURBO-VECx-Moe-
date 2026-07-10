@@ -90,12 +90,14 @@ the transport is scheduled differently.
   decoding): measures how often a low-bit resident draft of the model's own weights
   agrees with full precision at the token decision, i.e. the speculative acceptance rate.
   See the research notes below.
-- `scripts/svmi-fleet.py` — multi-agent capacity planner for the **MAVM** design
-  (Multi-Agent Virtual Memory): given a GGUF and a GPU preset, tabulates how many
-  concurrent agents fit, the marginal VRAM of each additional agent (its unique KV
-  only — weights are shared), tokens saved by shared-prefix KV dedup, aggregate
-  fleet throughput under stream-once-serve-many + BitSpec, and the VRAM reclaimed
-  by spilling idle agents' KV to host.
+- `scripts/svmi-fleet.py` — multi-agent, long-context capacity planner for the **MAVM**
+  and **CTX-VM** designs: given a GGUF (or `--profile 7b/8b/13b/70b`) and a GPU preset,
+  tabulates how many concurrent agents fit at up to 131K/256K context each, the marginal
+  VRAM *and host RAM* of each additional agent, tokens saved by shared-prefix KV dedup,
+  aggregate fleet throughput under stream-once-serve-many + BitSpec, and the wall that
+  binds first (VRAM vs host RAM) with the flag that moves it. Long contexts switch
+  automatically to paged KV: full KV in pinned host RAM, a landmark page table + hot
+  window in VRAM.
 
 ## Consumer GPUs (6–12 GB): 1660 Ti, RTX 2080 / 2080 Ti, RTX 3060
 
@@ -314,25 +316,31 @@ host (tier 1/2)                          GPU (< 20 GB)
 
 Novel techniques designed for this fork — bit-plane self-speculative decoding (BitSpec),
 pipelined streaming GEMM, stream-once-serve-many, elastic residency, draft-guided MoE
-prefetch, residual-precision transport, and **MAVM** (Multi-Agent Virtual Memory: shared
-weights, shared-prefix KV dedup, fleet-clock batching, and idle-KV spill for agent
-fleets) — are written up with bandwidth math, honesty notes, and build priorities in
-**[svmi-research.md](svmi-research.md)**. Two ship working offline validators:
-`scripts/svmi-bitspec.py` (BitSpec) and `scripts/svmi-fleet.py` (MAVM).
+prefetch, residual-precision transport, **MAVM** (Multi-Agent Virtual Memory: shared
+weights, shared-prefix KV dedup, fleet-clock batching, idle-KV spill), and **CTX-VM**
+(paged context virtual memory: full KV in pinned host RAM, landmark page table + hot
+window in VRAM, demand-fetched pages on the weight-streaming DMA path — what makes
+131K/256K context per agent fit consumer VRAM) — are written up with bandwidth math,
+honesty notes, and build priorities in **[svmi-research.md](svmi-research.md)**. Three
+ship working offline validators: `scripts/svmi-bitspec.py` (BitSpec) and
+`scripts/svmi-fleet.py` (MAVM + CTX-VM).
 
-### Running many agents on one small GPU (MAVM in one command)
+### Running many long-context agents on one small GPU (one command)
 
 ```sh
-# 32 coding agents, 8K ctx each, 2K shared system prompt, on a 12 GB RTX 3060
-python3 scripts/svmi-fleet.py models/model-q4_k_m.gguf --gpu 3060 \
-    --agents 1,2,4,8,16,32 --ctx 8192 --shared-prompt 2048
+# 16 agents of a 70B at 131,072 ctx each (96K shared corpus) on a 12 GB RTX 3060
+python3 scripts/svmi-fleet.py --profile 70b --gpu 3060 --agents 4,8,12,16 \
+    --ctx 131072 --shared-prompt 98304 --cold-kv-type q4_0 --kv-window 2048 --host-ram 128
 
-# no GGUF handy? plan a 70B fleet on a 2080 Ti from a synthetic profile
-python3 scripts/svmi-fleet.py --profile 70b --gpu 2080ti --agents 1,2,4,8 --ctx 4096
+# 8B at 262,144 ctx on the same card; or plan from a real GGUF instead of a profile
+python3 scripts/svmi-fleet.py --profile 8b --gpu 3060 --agents 4,8,16 --ctx 262144 \
+    --shared-prompt 131072 --cold-kv-type q4_0
+python3 scripts/svmi-fleet.py models/model.gguf --gpu 2080ti --agents 8,16 --ctx 131072
 ```
 
-The report answers, per agent count: does the fleet fit; how much of the model stays
-resident vs streamed; the marginal VRAM of the next agent; prompt tokens saved by prefix
-dedup; and the aggregate decode rate in the streaming-bound region. The rule of thumb it
-encodes: **weights cost O(1) in agents, KV costs O(N), and idle agents should cost ~0** —
-their KV spills to host and the freed VRAM promotes streamed layers resident.
+The report answers, per agent count: does the fleet fit (and if not, whether VRAM or host
+RAM is the wall and which flag moves it); resident vs streamed weights; the marginal
+VRAM + host RAM of the next agent; prompt tokens saved by prefix dedup; and the aggregate
+decode rate in the streaming-bound region. The rules of thumb it encodes: **weights cost
+O(1) in agents; paged KV costs O(window + ctx/page) in VRAM instead of O(ctx); the full
+context lives in host RAM (the cheap resource); idle agents cost ~0.**
