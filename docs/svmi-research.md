@@ -8,11 +8,12 @@ what to build. Everything is anchored to the SVMI axiom: for a model that does n
 VRAM, decode latency is `bytes_streamed / PCIe_bandwidth`, and the only ways to beat it
 are **stream less**, **stream denser**, **amortize each stream**, or **hide the stream** —
 plus, for multi-agent fleets, a fifth axis: **share every stream and every byte across
-agents** (§7), and for long context a sixth: **page the context itself** (§8).
+agents** (§7), for long context a sixth: **page the context itself** (§8), and the
+endgame seventh: **don't stream at all — send compute to the memory** (§9).
 
-Three of these ship with working, GPU-free validators: BitSpec
-(`scripts/svmi-bitspec.py`), and MAVM + CTX-VM (`scripts/svmi-fleet.py`); measured
-results are inline.
+Four of these ship with working, GPU-free validators: BitSpec
+(`scripts/svmi-bitspec.py`), MAVM + CTX-VM (`scripts/svmi-fleet.py`), and ARBITER
+(`scripts/svmi-arbiter.py`); measured results are inline.
 
 ---
 
@@ -266,6 +267,71 @@ that moves it (`--kv-window`, `--cold-kv-type q4_0`, `--host-ram`).
 
 ---
 
+## 9. ARBITER — compute follows memory  *(don't stream at all)*
+
+**The 2049 inversion.** Every offloading engine to date — including SVMI §1–§8 — treats
+the GPU as *the* computer and PCIe as the road weights must travel to reach it. Look at
+the machine the way a scheduler in 2049 would: it is three memory fabrics, each with
+silicon already attached —
+
+| fabric | bandwidth | attached compute |
+| --- | --- | --- |
+| VRAM | 360–1000 GB/s | GPU SMs |
+| DDR4/DDR5 | 35–280 GB/s | CPU cores (AVX-VNNI, AMX) |
+| PCIe | 12–48 GB/s | none — it's a pipe |
+
+Bandwidth-bound decode touches every weight once per token. Moving 1 GB of weights over
+PCIe 4.0 costs 42 ms; computing it *in place* on a DDR5 CPU costs 14 ms; in VRAM, 2.8 ms.
+**PCIe — the fabric offloading engines funnel everything through — is the slowest path in
+the machine.** The optimal policy is therefore: *weights never cross PCIe on the critical
+path*. Compute goes to where each weight already lives.
+
+**Mechanism.** ARBITER composes three pieces:
+
+1. **Bandwidth-arbitrage routing.** Split the weights between VRAM-resident (GPU
+   verifies) and host-resident (CPU verifies) shares, chosen not by layer-count
+   heuristics (`-ngl`) but by solving for the split that equalizes the two fabrics'
+   pass times — accounting for VRAM bandwidth, effective RAM bandwidth, the CPU's
+   quantized-GEMM FLOP ceiling, and the speculative batch size `E`. The optimum moves
+   when any of those change, which is why it must be solved, not hard-coded.
+2. **Cross-fabric draft/verify pipelining.** The resident draft (BitSpec low-bit copy or
+   a small model) generates the next speculative run on the GPU *while* the CPU verifies
+   the previous batch — the two fabrics work concurrently instead of taking turns. The
+   CPU reads each host weight **once per batch of E tokens** (speculative verification is
+   a batch-E GEMM), which is what lets a 70 GB/s memory system behave like a 350 GB/s one
+   at E = 5. Stock partial offload gets neither the batching nor the overlap.
+3. **PCIe demoted to a background lane.** Freed of weight traffic, PCIe carries only
+   per-layer activations (kilobytes) and **elastic residency migration**: hot layers
+   promote into VRAM at ~90 % of link rate behind the compute, continuously re-balancing
+   the arbitrage split as VRAM frees (§4 gets a dedicated free channel).
+
+**Exactness.** Verification computes the true model everywhere; ARBITER changes *where*
+the math runs, never the math. Token-identical by construction.
+
+**Modeled results** (`scripts/svmi-arbiter.py`, real shapes, conservative CPU numbers):
+
+| config | stock partial offload | SVMI stream+spec | **ARBITER** |
+| --- | --- | --- | --- |
+| 70B Q4_K_M, RTX 3060 + DDR5-2ch, 16 cores | 2.0 tok/s | 3.4 | **10.3 (5.2×)** |
+| 70B Q4_K_M, RTX 2080 Ti + DDR4-2ch, 8 cores | 1.0 tok/s | 1.7 | **5.0 (5.1×)** |
+| 8B Q4_K_M, RTX 3060 + DDR5-2ch | 72.9 tok/s | 174.6 | **208.1 (2.9×)** |
+
+The tool also names the binding resource at the optimum (usually CPU RAM bandwidth or
+FLOPs) — meaning the next dollar goes to RAM or cores, not a bigger GPU.
+
+**Honesty notes.** (a) The CPU must actually be available — a busy host (MAVM fleets
+doing tool work) shrinks the CPU share; the router re-solves with a utilization factor.
+(b) Effective RAM bandwidth assumes NUMA-local pinned allocations; cross-socket traffic
+halves it. (c) The draft must fit in VRAM next to the GPU share — for a 70B on a 12 GB
+card that means a ~1 GiB external draft or a *partial* BitSpec copy, so `E ≈ 4–5` is the
+conservative planning number, not the measured 7. (d) llama.cpp already runs host layers
+on CPU at batch 1; the 5× comes from the *combination* of batched speculative
+verification on the CPU, solved (not guessed) splits, and draft/verify overlap — each
+piece alone is worth far less. (e) Laptop thermals can clip sustained CPU GEMM; derate
+`--cores`.
+
+---
+
 ## Composition and priority
 
 The multipliers stack: `throughput ≈ base_tps × E[tokens] (BitSpec) × N (serve-many)`,
@@ -277,11 +343,14 @@ Build priority by expected payoff per unit of engineering risk:
 2. **Elastic residency (§4)** — cheap, safe, immediate; pure host-side scheduler logic.
 3. **Stream-once-serve-many (§3)** — high value for `llama-server` deployments.
 4. **Pipelined streaming GEMM (§2)** — solid prefill/tail win; needs a tiling-aware kernel.
-5. **MAVM (§7)** — the multiplier for agentic fleets; §3 + prefix dedup + KV spill composed into one substrate, planned with `svmi-fleet.py`.
-6. **CTX-VM (§8)** — the prerequisite for 131K/256K context on consumer VRAM; extends §7, planned with the same tool.
-7. **Draft-guided MoE prefetch (§5)** — high value but MoE-only; depends on §1.
-8. **Residual-precision streaming (§6)** — validate-then-maybe; likely a documented negative.
+5. **ARBITER (§9)** — the largest modeled decode multiplier for models that don't fit
+   (5× over stock partial offload); reuses §1's draft and existing CPU kernels, so the
+   new engineering is the router and the overlap, not new math.
+6. **MAVM (§7)** — the multiplier for agentic fleets; §3 + prefix dedup + KV spill composed into one substrate, planned with `svmi-fleet.py`.
+7. **CTX-VM (§8)** — the prerequisite for 131K/256K context on consumer VRAM; extends §7, planned with the same tool.
+8. **Draft-guided MoE prefetch (§5)** — high value but MoE-only; depends on §1.
+9. **Residual-precision streaming (§6)** — validate-then-maybe; likely a documented negative.
 
 All preserve token-identity (BitSpec/§5 via exact verification, CTX-VM/§8 via its exact
-modes; the rest by construction), which keeps SVMI's core promise: same outputs, a
-fraction of the VRAM.
+modes, ARBITER/§9 by routing-not-math; the rest by construction), which keeps SVMI's
+core promise: same outputs, a fraction of the VRAM.

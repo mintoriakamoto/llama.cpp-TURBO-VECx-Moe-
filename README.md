@@ -30,6 +30,7 @@ What's in this branch (all opt-in, off by default):
 | Benchmark harness + compressed-transport feasibility study | `scripts/svmi-bench.sh`, `scripts/svmi-entropy.py` |
 | BitSpec feasibility — acceptance rate of a low-bit resident self-draft (novel; see research notes) | `scripts/svmi-bitspec.py` |
 | MAVM + CTX-VM fleet planner — how many agents at 131K/256K context fit one GPU: shared weights (O(1) in agents), paged KV (host-resident context, landmark page table + hot window in VRAM), shared-prefix dedup, idle spill | `scripts/svmi-fleet.py` |
+| ARBITER routing optimizer — compute follows memory: GPU + CPU verify their own resident shares concurrently, zero weight bytes on PCIe, split solved by bandwidth arbitrage (modeled 5× stock partial offload for 70B) | `scripts/svmi-arbiter.py` |
 
 ```bash
 # 70B Q4_K_M on a 20 GB budget:
@@ -48,8 +49,8 @@ Full design, research report, and roadmap (offload-aware speculative decoding,
 entropy-coded transport, MoE expert paging): **[docs/svmi.md](docs/svmi.md)**.
 Novel techniques designed for this fork (BitSpec self-speculation, pipelined streaming
 GEMM, stream-once-serve-many, elastic residency, MAVM multi-agent virtual memory,
-CTX-VM paged 131K/256K context, ...) with bandwidth math and honesty notes:
-**[docs/svmi-research.md](docs/svmi-research.md)**.
+CTX-VM paged 131K/256K context, ARBITER compute-follows-memory routing, ...) with
+bandwidth math and honesty notes: **[docs/svmi-research.md](docs/svmi-research.md)**.
 
 Lineage: supersedes the `fable5/prefetch-experts` patches from
 [thecodacus/llama.cpp](https://github.com/thecodacus/llama.cpp) (pinning + MoE expert

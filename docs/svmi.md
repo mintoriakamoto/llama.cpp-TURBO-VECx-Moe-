@@ -98,6 +98,11 @@ the transport is scheduled differently.
   binds first (VRAM vs host RAM) with the flag that moves it. Long contexts switch
   automatically to paged KV: full KV in pinned host RAM, a landmark page table + hot
   window in VRAM.
+- `scripts/svmi-arbiter.py` — cross-fabric routing optimizer for the **ARBITER** design:
+  given GPU + CPU presets, solves the bandwidth-arbitrage split (GPU verifies the
+  VRAM-resident share, CPU verifies the host share in speculative batches, PCIe carries
+  zero weights on the critical path) and compares decode rate against streaming and
+  stock partial offload. Names the binding resource at the optimum.
 
 ## Consumer GPUs (6–12 GB): 1660 Ti, RTX 2080 / 2080 Ti, RTX 3060
 
@@ -320,10 +325,21 @@ prefetch, residual-precision transport, **MAVM** (Multi-Agent Virtual Memory: sh
 weights, shared-prefix KV dedup, fleet-clock batching, idle-KV spill), and **CTX-VM**
 (paged context virtual memory: full KV in pinned host RAM, landmark page table + hot
 window in VRAM, demand-fetched pages on the weight-streaming DMA path — what makes
-131K/256K context per agent fit consumer VRAM) — are written up with bandwidth math,
-honesty notes, and build priorities in **[svmi-research.md](svmi-research.md)**. Three
-ship working offline validators: `scripts/svmi-bitspec.py` (BitSpec) and
-`scripts/svmi-fleet.py` (MAVM + CTX-VM).
+131K/256K context per agent fit consumer VRAM), and **ARBITER** (compute-follows-memory:
+weights never cross PCIe on the critical path — the GPU drafts and verifies its resident
+share while the CPU verifies the host share in speculative batches, with the split solved
+by bandwidth arbitrage; modeled 5× over stock partial offload for a 70B on consumer
+hardware) — are written up with bandwidth math, honesty notes, and build priorities in
+**[svmi-research.md](svmi-research.md)**. Four ship working offline validators:
+`scripts/svmi-bitspec.py` (BitSpec), `scripts/svmi-fleet.py` (MAVM + CTX-VM), and
+`scripts/svmi-arbiter.py` (ARBITER).
+
+### What should this machine do with a model that doesn't fit? (one command)
+
+```sh
+# 70B on a 12 GB RTX 3060 with a DDR5 desktop CPU
+python3 scripts/svmi-arbiter.py --profile 70b --gpu 3060 --cpu ddr5-2ch --cores 16
+```
 
 ### Running many long-context agents on one small GPU (one command)
 
