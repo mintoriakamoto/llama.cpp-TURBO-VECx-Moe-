@@ -12,6 +12,9 @@ runs:
       id: tag
       shell: bash
       run: |
+        # container jobs: the workspace is owned by the runner uid, not the
+        # container user, and git refuses to operate without this
+        git config --global --add safe.directory "${GITHUB_WORKSPACE:-$(pwd)}" 2>/dev/null || true
         BUILD_NUMBER="$(git rev-list --count HEAD)"
         SHORT_HASH="$(git rev-parse --short=7 HEAD)"
         if [[ "${{ env.BRANCH_NAME }}" == "master" ]]; then
