@@ -137,6 +137,7 @@ def main() -> int:
         r = pass_time(share)
         if best is None or r[2] > best[2]:
             best = (*r, share)
+    assert best is not None  # loop always runs at least once
     t_gpu_b, t_cpu_b, arb_tps, arb_share = best
 
     # 2. SVMI pure streaming + spec: draft on GPU, verify streams host share over PCIe
@@ -173,9 +174,9 @@ def main() -> int:
         ("SVMI streaming + spec", stream_tps,
          f"streams {streamed:.1f} GB/pass over PCIe"),
         ("stock partial offload", stock_tps,
-         f"CPU share unbatched (no speculation)"),
+         "CPU share unbatched (no speculation)"),
         ("pure CPU + spec", cpu_tps,
-         f"no GPU; RAM-bandwidth bound"),
+         "no GPU; RAM-bandwidth bound"),
     ]
     print(f"{'mode':<32} {'tok/s':>7}  notes")
     for name, tps, note in rows:
@@ -190,7 +191,7 @@ def main() -> int:
           f"{mig_bw:.0f} GB/s free for\n  background residency migration -> promoting "
           f"{max(0.0, min(W, resident_room)):.1f} GB takes "
           f"{max(0.0, min(W, resident_room))/mig_bw:.1f} s, amortized across the session.")
-    bind = "CPU flops" if (2.0*((W-arb_share)/W*params)*E/cpu_flops) > (W-arb_share)/ram_bw \
+    bind = "CPU flops" if (2.0 * ((W - arb_share) / W * params) * E / cpu_flops) > (W - arb_share) / ram_bw \
         else "CPU RAM bandwidth"
     print(f"binding resource at optimum: {bind} -> next win: more cores/AMX "
           f"or faster RAM, not a faster GPU.")

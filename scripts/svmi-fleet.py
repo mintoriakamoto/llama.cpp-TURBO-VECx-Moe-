@@ -251,7 +251,6 @@ def main() -> int:
         print(f"prefix dedup   : {shared_ctx:,}-tok shared corpus prefilled once -> saves "
               f"{saved:,} prompt tokens at {big} agents "
               f"({saved/(saved+total_work):.0%} of fleet prefill+decode work)")
-    reclaim = args.idle_frac * (kv_vram_agent if paged else kv_vram_agent)
     print(f"idle spill     : at {args.idle_frac:.0%} idle, each parked agent frees "
           f"{kv_vram_agent/GiB:.2f} GiB VRAM (hot window + page table page out; "
           f"wake-up hides behind the first layers' compute)")

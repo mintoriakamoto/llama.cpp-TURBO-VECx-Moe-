@@ -195,7 +195,7 @@ def main() -> int:
             ffn_resident.add(layer)
 
     streamed_layers = sorted(set(range(n_layer)) - ffn_resident)
-    streamed_bytes = sum(layer_ffn.get(l, 0) for l in streamed_layers)
+    streamed_bytes = sum(layer_ffn.get(lid, 0) for lid in streamed_layers)
 
     print(f"model              : {Path(args.model).name} ({arch}, {n_layer} layers, "
           f"{total_size / GiB:.2f} GiB weights)")
@@ -221,7 +221,7 @@ def main() -> int:
         return 0
 
     # compact regex alternation for the streamed layer ids
-    ids = "|".join(str(l) for l in streamed_layers)
+    ids = "|".join(str(lid) for lid in streamed_layers)
     ot = f"blk\\.({ids})\\.ffn_.*=CPU"
 
     print("# flags implementing this plan:")

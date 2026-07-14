@@ -143,8 +143,8 @@ def main() -> int:
     maxk = max(topk_list)
     # indices of the draft's top-maxk, per trial, computed once per bit-width below
 
-    print(f"{'bits':>4} {'draft MiB':>9} {'resident%':>9} " +
-          " ".join(f'top{k:<2} acc' for k in topk_list))
+    print(f"{'bits':>4} {'draft MiB':>9} {'resident%':>9} "
+          + " ".join(f'top{k:<2} acc' for k in topk_list))
     results = {}
     for bits in bits_list:
         Wq = rowwise_quant(W, bits)
@@ -163,8 +163,8 @@ def main() -> int:
         results[bits] = dict(zip(topk_list, accs))
         draft_mib = vocab * hidden * bits / 8 / 1024**2
         resident_pct = bits / 16.0 * 100
-        print(f"{bits:>4} {draft_mib:9.1f} {resident_pct:8.1f}% " +
-              " ".join(f'{a:8.1%}' for a in accs))
+        print(f"{bits:>4} {draft_mib:9.1f} {resident_pct:8.1f}% "
+              + " ".join(f'{a:8.1%}' for a in accs))
 
     # translate top-1 acceptance into a decode-speedup estimate under the bandwidth model
     L = args.draft_len
