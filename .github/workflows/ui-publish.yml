@@ -20,6 +20,8 @@ jobs:
   publish:
     name: Publish UI Static Output
     needs: build
+    # skip on repos without a configured HF bucket (e.g. forks without upstream's token)
+    if: ${{ vars.HF_BUCKET_UI_STATIC_OUTPUT != '' }}
     runs-on: ubuntu-slim
 
     permissions:
