@@ -188,6 +188,7 @@ jobs:
           REPO_OWNER="${GITHUB_REPOSITORY_OWNER@L}"  # to lower case
           REPO_NAME="${{ github.event.repository.name }}"
           REPO_NAME="${REPO_NAME@L}"  # image names must be lower case
+          REPO_NAME="$(sed -E 's/[-._]+$//' <<< "$REPO_NAME")"  # and must not end with a separator
           IMAGE_REPO="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
           PREFIX="${IMAGE_REPO}:"
           PLATFORM="${{ matrix.config.platforms }}"
@@ -434,6 +435,7 @@ jobs:
           REPO_OWNER="${GITHUB_REPOSITORY_OWNER@L}"  # to lower case
           REPO_NAME="${{ github.event.repository.name }}"
           REPO_NAME="${REPO_NAME@L}"  # image names must be lower case
+          REPO_NAME="$(sed -E 's/[-._]+$//' <<< "$REPO_NAME")"  # and must not end with a separator
           IMAGE_REPO="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
           PREFIX="${IMAGE_REPO}:"
           SRC_TAG="${{ needs.create_tag.outputs.source_tag }}"
