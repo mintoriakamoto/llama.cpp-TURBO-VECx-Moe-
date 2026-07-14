@@ -11,7 +11,11 @@ runs:
     - name: Clear caches
       shell: bash
       run: |
-        CACHES=$(gh cache list --key "ccache-${{ inputs.key }}" --json id,key --jq '.[] | "\(.id) \(.key)"' 2>/dev/null)
+        if ! command -v gh >/dev/null 2>&1; then
+          echo "::warning::gh CLI not available (container job?) - skipping cache clear"
+          exit 0
+        fi
+        CACHES=$(gh cache list --key "ccache-${{ inputs.key }}" --json id,key --jq '.[] | "\(.id) \(.key)"' 2>/dev/null || true)
         if [ -z "$CACHES" ]; then
           echo "No caches found with key prefix: ${{ inputs.key }}"
           exit 0
