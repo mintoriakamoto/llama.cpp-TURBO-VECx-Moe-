@@ -348,12 +348,8 @@ jobs:
       actions: write
 
     steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
+      # install git before checkout: without it actions/checkout falls back to a
+      # tarball download and the workspace has no .git for get-tag-name
       - name: Dependencies
         id: depends
         env:
@@ -361,6 +357,12 @@ jobs:
         run: |
           apt update
           apt install -y build-essential cmake ninja-build git curl libssl-dev libgomp1
+
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
