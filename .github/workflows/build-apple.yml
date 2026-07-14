@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/build-apple.yml',
       '**/CMakeLists.txt',
@@ -50,7 +50,7 @@ jobs:
         with:
           key: apple-arm64
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build
         id: cmake_build
@@ -86,7 +86,7 @@ jobs:
         with:
           key: apple-x64
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build
         id: cmake_build
@@ -170,7 +170,7 @@ jobs:
         with:
           key: apple-tvos
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build
         id: cmake_build
@@ -204,7 +204,7 @@ jobs:
         with:
           key: apple-visionos
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build
         id: cmake_build
@@ -243,7 +243,7 @@ jobs:
         with:
           key: apple-swift
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Download xcframework artifact
         uses: actions/download-artifact@v7

@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/build-webgpu.yml',
       '**/CMakeLists.txt',
@@ -71,7 +71,7 @@ jobs:
         with:
           key: webgpu-macos-latest
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Dawn Dependency
         id: dawn-depends
@@ -112,7 +112,7 @@ jobs:
         with:
           key: webgpu-ubuntu-24.04
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Dependencies
         id: depends
@@ -165,7 +165,7 @@ jobs:
         with:
           key: webgpu-ubuntu-24.04-arm-wasm
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install Emscripten
         run: |

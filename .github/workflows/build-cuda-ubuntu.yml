@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/build-cuda-ubuntu.yml',
       '**/CMakeLists.txt',
@@ -57,7 +57,7 @@ jobs:
         with:
           key: cuda-ubuntu-24.04-cuda
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build with CMake
         # TODO: Remove GGML_CUDA_CUB_3DOT2 flag once CCCL 3.2 is bundled within CTK and that CTK version is used in this project
@@ -99,7 +99,7 @@ jobs:
         with:
           key: cuda-ubuntu-22.04-hip
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build with native CMake HIP support
         id: cmake_build
@@ -131,7 +131,7 @@ jobs:
         with:
           key: cuda-ubuntu-22.04-musa
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build with native CMake MUSA support
         id: cmake_build

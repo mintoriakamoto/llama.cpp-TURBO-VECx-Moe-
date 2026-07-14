@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/build-cpu.yml',
       '.github/workflows/build-cmake-pkg.yml',
@@ -65,7 +65,7 @@ jobs:
         with:
           key: cpu-${{ matrix.os }}
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build Dependencies
         id: build_depends
@@ -150,7 +150,7 @@ jobs:
           key: cpu-windows-2025-${{ matrix.build }}
           variant: ccache
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Download OpenBLAS
         id: get_openblas

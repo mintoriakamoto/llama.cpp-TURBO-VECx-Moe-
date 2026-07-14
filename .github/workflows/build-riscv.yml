@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/build-riscv.yml',
       '**/CMakeLists.txt',
@@ -71,7 +71,7 @@ jobs:
       #  with:
       #    key: riscv-ubuntu-native
       #    evict-old-files: 1d
-      #    save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+      #    save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build
         id: cmake_build
@@ -141,7 +141,7 @@ jobs:
       #  with:
       #    key: riscv-ubuntu-native-sanitizer-${{ matrix.sanitizer }}-${{ matrix.build_type }}
       #    evict-old-files: 1d
-      #    save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+      #    save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build
         id: cmake_build

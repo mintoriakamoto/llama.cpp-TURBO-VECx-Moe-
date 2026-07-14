@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/build-vulkan.yml',
       '**/CMakeLists.txt',
@@ -58,7 +58,7 @@ jobs:
           key: vulkan-ubuntu-24.04-arm-new
           variant: ccache
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Configure
         id: cmake_configure
@@ -112,7 +112,7 @@ jobs:
         with:
           key: vulkan-ubuntu-24.04-llvmpipe
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build
         id: cmake_build
