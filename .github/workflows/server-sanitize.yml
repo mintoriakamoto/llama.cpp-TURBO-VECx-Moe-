@@ -1,29 +1,8 @@
 name: Server (sanitize)
 
 on:
-  workflow_dispatch: # allows manual triggering
-    inputs:
-      sha:
-        description: 'Commit SHA1 to build'
-        required: false
-        type: string
-      slow_tests:
-        description: 'Run slow tests'
-        required: true
-        type: boolean
-  push:
-    branches:
-      - main
-    paths: [
-      '.github/workflows/server-sanitize.yml',
-      '**/CMakeLists.txt',
-      '**/Makefile',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      'tools/server/**.*'
-    ]
+  # this repo has no runners for this workflow - manual trigger only
+  workflow_dispatch:
 
 env:
   LLAMA_ARG_LOG_COLORS: 1

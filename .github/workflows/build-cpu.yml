@@ -42,6 +42,8 @@ env:
 
 jobs:
   build-cmake-pkg:
+    # requires a self-hosted runner this repo does not have
+    if: ${{ github.repository_owner == 'ggml-org' }}
     uses: ./.github/workflows/build-cmake-pkg.yml
 
   ubuntu:

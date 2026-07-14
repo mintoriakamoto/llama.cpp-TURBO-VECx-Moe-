@@ -35,6 +35,8 @@ env:
 
 jobs:
   ubuntu-24-openvino:
+    # requires a self-hosted OpenVINO runner this repo does not have
+    if: ${{ github.repository_owner == 'ggml-org' }}
     runs-on: [self-hosted, Linux, Intel, OpenVINO]
 
     env:

@@ -1,47 +1,8 @@
 name: CI (self-hosted)
 
 on:
-  workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - main
-    paths: [
-      '.github/workflows/build.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      '**/*.cu',
-      '**/*.cuh',
-      '**/*.swift',
-      '**/*.m',
-      '**/*.metal',
-      '**/*.comp',
-      '**/*.glsl',
-      '**/*.wgsl'
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/build-self-hosted.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      '**/*.cu',
-      '**/*.cuh',
-      '**/*.swift',
-      '**/*.m',
-      '**/*.metal',
-      '**/*.comp',
-      '**/*.glsl',
-      '**/*.wgsl'
-    ]
+  # this repo has no runners for this workflow - manual trigger only
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
