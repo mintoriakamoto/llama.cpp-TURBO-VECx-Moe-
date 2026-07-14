@@ -1,4 +1,5 @@
 name: Release
+# note: pushes to main publish a tagged release with binaries for every platform
 
 on:
   workflow_dispatch: # allows manual triggering
