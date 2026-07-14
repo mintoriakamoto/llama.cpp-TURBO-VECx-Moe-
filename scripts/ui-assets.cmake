@@ -238,8 +238,19 @@ function(hf_download version out_var out_resolved)
 
         file(ARCHIVE_EXTRACT INPUT "${archive}" DESTINATION "${DIST_DIR}")
 
-        if(NOT EXISTS "${DIST_DIR}/index.html")
+        # Reject archives that lack any asset llama-ui-embed requires (e.g. an
+        # upstream 'latest' bucket that has diverged from this tree), otherwise
+        # emit_files() would hard-fail the build on an incompatible download.
+        set(missing_assets FALSE)
+        foreach(pat "index.html" "loading.html" "manifest.webmanifest" "sw.js" "build.json" "version.json" "bundle*.js" "bundle*.css" "workbox*.js")
+            file(GLOB_RECURSE matched "${DIST_DIR}/*/${pat}" "${DIST_DIR}/${pat}")
+            if(matched STREQUAL "")
+                set(missing_assets TRUE)
+            endif()
+        endforeach()
+        if(missing_assets)
             message(STATUS "UI: archive from ${resolved} is missing required assets")
+            file(REMOVE_RECURSE "${DIST_DIR}")
             continue()
         endif()
 
