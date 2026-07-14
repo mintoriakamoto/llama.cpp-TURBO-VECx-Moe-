@@ -1,26 +1,8 @@
 name: CI (cann)
 
 on:
-  workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - main
-    paths: [
-      '.github/workflows/build-cann.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp'
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/build-cann.yml',
-      'ggml/src/ggml-cann/**'
-    ]
+  # CANN builds are disabled upstream and this repo has no Ascend runners - manual trigger only
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
@@ -34,6 +16,13 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  # all real jobs below are commented out; Actions rejects a workflow with an
+  # empty jobs section, so keep a no-op placeholder
+  disabled:
+    runs-on: ubuntu-slim
+    if: ${{ false }}
+    steps:
+      - run: echo "CANN builds are disabled"
 # TODO: this build is disabled to save Github Actions resources (https://github.com/ggml-org/llama.cpp/pull/23705)
 #       in order to enable it again, we have to provision dedicated runners  to run it
 #  openEuler-latest-cann:
