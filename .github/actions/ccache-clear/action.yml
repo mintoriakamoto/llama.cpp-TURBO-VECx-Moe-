@@ -18,5 +18,5 @@ runs:
         fi
         while read -r id key; do
           echo "Deleting cache: $id ($key)"
-          gh cache delete "$id"
+          gh cache delete "$id" || echo "::warning::Failed to delete cache $id ($key) - token may lack actions:write"
         done <<< "$CACHES"

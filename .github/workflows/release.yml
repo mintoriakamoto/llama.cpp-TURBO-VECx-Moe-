@@ -176,8 +176,6 @@ jobs:
             os: ubuntu-22.04
           - build: 'arm64'
             os: ubuntu-24.04-arm
-          - build: 's390x'
-            os: ubuntu-24.04-s390x
 
     runs-on: ${{ matrix.os }}
 
@@ -344,6 +342,9 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: ubuntu-latest
+
+    permissions:
+      actions: write
 
     #permissions:
     #  actions: write
@@ -556,6 +557,9 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2022
+
+    permissions:
+      actions: write
 
     outputs:
       openvino_version: ${{ steps.openvino_version.outputs.value }}
@@ -940,6 +944,9 @@ jobs:
 
     runs-on: windows-2022
 
+    permissions:
+      actions: write
+
     defaults:
       run:
         shell: bash
@@ -1058,6 +1065,9 @@ jobs:
             fp16: ON
 
     runs-on: ubuntu-24.04
+
+    permissions:
+      actions: write
 
     env:
       ONEAPI_ROOT: /opt/intel/oneapi/
