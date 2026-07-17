@@ -52,6 +52,9 @@ GPU_PRESETS = {
     "3090": (24, "4.0-x16", 2), "4070": (12, "4.0-x16", 2), "4090": (24, "4.0-x16", 2),
 }
 KV_BPE = {"f16": 2.0, "q8_0": 1.0625, "q5_1": 0.75, "q4_0": 0.5625}
+# landmark bytes per (page, layer, kv-head): f16 vector vs product-quantized codes (§11)
+LANDMARK_BYTES = {"f16": None, "pq32": 32, "pq16": 16, "pq8": 8}   # None -> head_dim*2
+LAT_ROPE_DIMS = 64  # decoupled RoPE dims kept exact by KV-LAT (§10)
 
 # synthetic profiles (Q4_K_M-class weights) so a fleet can be planned without the GGUF:
 # (n_layer, n_embd, n_head, n_head_kv, total weight GiB, streamable frac)
@@ -80,6 +83,14 @@ def main() -> int:
     ap.add_argument("--kv-type", choices=list(KV_BPE), default="q8_0", help="hot (VRAM) KV quant")
     ap.add_argument("--cold-kv-type", choices=list(KV_BPE), default=None,
                     help="host-resident cold-page KV quant (default: same as --kv-type)")
+    ap.add_argument("--kv-lat", type=int, default=0, metavar="R",
+                    help="KV-LAT latent rank per layer (0=off); see svmi-kvlat.py (§10)")
+    ap.add_argument("--landmarks", choices=sorted(LANDMARK_BYTES), default="f16",
+                    help="page-table landmark encoding (§11); pq16 = 16x smaller index")
+    ap.add_argument("--prefetch-hit", type=float, default=0.0, metavar="H",
+                    help="SPEC-PF prefetch hit rate 0..1 (§12); see svmi-pageprefetch.py")
+    ap.add_argument("--prune-cold", type=float, default=0.0, metavar="F",
+                    help="cold-tier fraction pruned by the attention-mass ledger (§13, lossy)")
     ap.add_argument("--kv-mode", choices=["auto", "full", "paged"], default="auto",
                     help="full: whole KV in VRAM; paged: CTX-VM demand paging; auto: paged "
                          "when ctx > 16K or full per-agent KV exceeds 1.5 GiB")
@@ -153,8 +164,12 @@ def main() -> int:
 
     hot_bpe  = KV_BPE[args.kv_type]
     cold_bpe = KV_BPE[args.cold_kv_type or args.kv_type]
-    kv_tok_hot  = 2 * head_dim * n_head_kv * n_layer * hot_bpe    # bytes/token, all layers
-    kv_tok_cold = 2 * head_dim * n_head_kv * n_layer * cold_bpe
+    if args.kv_lat > 0:   # KV-LAT (§10): one shared latent + decoupled RoPE key per layer
+        kv_tok_hot  = (args.kv_lat + LAT_ROPE_DIMS) * n_layer * hot_bpe
+        kv_tok_cold = (args.kv_lat + LAT_ROPE_DIMS) * n_layer * cold_bpe
+    else:
+        kv_tok_hot  = 2 * head_dim * n_head_kv * n_layer * hot_bpe    # bytes/token, all layers
+        kv_tok_cold = 2 * head_dim * n_head_kv * n_layer * cold_bpe
 
     shared_ctx = min(args.shared_prompt, args.ctx)
     unique_ctx = args.ctx - shared_ctx
@@ -163,16 +178,18 @@ def main() -> int:
     paged = args.kv_mode == "paged" or (
         args.kv_mode == "auto" and (args.ctx > 16384 or full_kv_agent > 1.5 * GiB))
 
-    landmark_page = n_layer * n_head_kv * head_dim * 2            # one f16 key landmark/page
+    lm_bytes = LANDMARK_BYTES[args.landmarks]
+    landmark_page = n_layer * n_head_kv * (head_dim * 2 if lm_bytes is None else lm_bytes)
     if paged:
         window = min(args.kv_window, args.ctx)
         pages_unique = math.ceil(unique_ctx / args.page)
         pages_shared = math.ceil(shared_ctx / args.page)
         kv_vram_agent  = int(window * kv_tok_hot) + pages_unique * landmark_page
         kv_vram_shared = pages_shared * landmark_page             # landmarks only, stored once
-        kv_host_agent  = int(unique_ctx * kv_tok_cold)
-        kv_host_shared = int(shared_ctx * kv_tok_cold)
-        kv_fetch_bytes = int(args.kv_fetch * kv_tok_cold)         # per decode step per agent
+        kv_host_agent  = int(unique_ctx * kv_tok_cold * (1.0 - args.prune_cold))
+        kv_host_shared = int(shared_ctx * kv_tok_cold)            # shared corpus never pruned
+        # per decode step per agent; SPEC-PF-hidden fetches leave the critical path (§12)
+        kv_fetch_bytes = int(args.kv_fetch * kv_tok_cold * (1.0 - args.prefetch_hit))
     else:
         kv_vram_agent  = full_kv_agent
         kv_vram_shared = int(kv_tok_hot * shared_ctx)
@@ -193,6 +210,17 @@ def main() -> int:
     print(f"kv mode      : {'CTX-VM paged' if paged else 'full-in-VRAM'}"
           + (f"  (window {args.kv_window:,} tok, {args.page}-tok pages, "
              f"~{args.kv_fetch} tok fetched/step)" if paged else ""))
+    wave2 = []
+    if args.kv_lat > 0:
+        wave2.append(f"KV-LAT r={args.kv_lat}+{LAT_ROPE_DIMS} rope")
+    if args.landmarks != "f16":
+        wave2.append(f"{args.landmarks} landmarks")
+    if args.prefetch_hit > 0:
+        wave2.append(f"SPEC-PF hit {args.prefetch_hit:.0%}")
+    if args.prune_cold > 0:
+        wave2.append(f"cold pruned {args.prune_cold:.0%} (lossy)")
+    if wave2:
+        print("second wave  : " + ", ".join(wave2))
     if paged:
         print(f"kv/agent     : VRAM {kv_vram_agent/GiB:.2f} GiB (vs {full_kv_agent/GiB:.1f} full "
               f"-> {full_kv_agent/max(1,kv_vram_agent):.0f}x smaller) + host {kv_host_agent/GiB:.2f} GiB")

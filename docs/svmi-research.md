@@ -354,3 +354,142 @@ Build priority by expected payoff per unit of engineering risk:
 All preserve token-identity (BitSpec/§5 via exact verification, CTX-VM/§8 via its exact
 modes, ARBITER/§9 by routing-not-math; the rest by construction), which keeps SVMI's
 core promise: same outputs, a fraction of the VRAM.
+
+---
+
+# Second wave — July 2026: shrinking the context itself
+
+The first wave (§1–§9) moved weights and KV *around* — streamed, paged, shared. The
+second wave shrinks what has to move at all. Four techniques plus one allocator change,
+each with a validator; the fleet planner (`scripts/svmi-fleet.py`) models all of them
+via `--kv-lat`, `--landmarks`, `--prefetch-hit`, and `--prune-cold`.
+
+## 10. KV-LAT — latent KV compression (MLA-style retrofit)
+
+**Problem.** CTX-VM (§8) made KV *capacity* cheap (host RAM) but every fetched page
+still pays full GQA bytes over PCIe, and the cold tier still costs ~2.8 GiB/agent for a
+70B @131K even at q4_0. The KV bytes themselves are the next wall.
+
+**Idea.** DeepSeek's MLA showed attention can run from a small per-token *latent*
+instead of full K/V: cache `c_t = x_t W_down` (rank `r`, shared across KV heads) and
+absorb the up-projections into the attention matmuls, keeping only a small decoupled
+RoPE key (`d_r` dims) exact. This fork already carries MLA-style cache plumbing for
+DeepSeek architectures (`src/llama-kv-cache-dsv4.*`); KV-LAT is the **retrofit** of the
+same trick onto stock GQA checkpoints: jointly factor each layer's `[W_K; W_V]` with a
+truncated (activation-whitened) SVD, fine-tune nothing, verify everything.
+
+* Bytes/token/layer drop from `2 · d_head · n_head_kv · bpe` to `(r + d_r) · bpe` —
+  for a 70B (GQA-8, d_head 128): 2,048 → ~640 bytes at r 512 (q8), a **3.2×** cut that
+  multiplies every CTX-VM number: cold tier, fetch traffic, and host-RAM wall.
+* Composes with §8's landmarks (they index latents just as well) and §1's BitSpec
+  (periodic dense verification bounds the approximation).
+
+**Validator** (`scripts/svmi-kvlat.py`): per-layer SVD spectra of `[W_K; W_V]` from a
+real GGUF (dequantized via gguf-py) or a synthetic ensemble; reports the rank needed for
+95/99/99.9 % spectral energy and the resulting bytes/token vs the GQA baseline.
+
+**Honesty notes.** (a) Weight-space energy is an *optimistic proxy*: production ranks
+need activation-aware calibration (whiten by the input covariance, à la 2025's
+TransMLA/X-MLA retrofits) and a held-out perplexity check. (b) Token identity is lost
+at finite rank — recover it with BitSpec-style verification or reserve KV-LAT for the
+*cold* tier only (hot window stays exact). (c) RoPE does not commute with the down
+projection; the decoupled-RoPE dims (`d_r`, typically 32–64) are the price of admission.
+
+## 11. CTX-VM v2 — product-quantized landmarks, two-level page table
+
+**Problem.** §8's f16 landmarks cost `n_layer · n_head_kv · d_head · 2` bytes/page —
+160 KiB/page for a 70B. At 131K that is a pleasant 80 MiB; at **1M tokens it is 640 MiB
+per agent**, and the index itself becomes the VRAM wall it was built to remove.
+
+**Idea.** Landmarks are lookup keys, not math operands — compress them like a vector
+database would. Product-quantize each per-head landmark (M sub-vectors × 8-bit codes,
+shared 256-entry codebooks per layer), and add a coarse level: super-pages of 16 pages
+with one f16 centroid, scored first; only surviving super-pages have their PQ codes
+scored at all.
+
+* `pq16` (M=16): 16 bytes/head/page → **16×** smaller index; 1M-token index for a 70B
+  drops 640 MiB → 40 MiB. `pq8` halves it again for recall-tolerant workloads.
+* Scoring cost falls with the coarse level: `O(n_super + 16·k_super)` instead of
+  `O(n_pages)` — at 1M ctx that is ~50× fewer landmark dot products per step.
+
+**Validator** (`scripts/svmi-pqindex.py`): top-k page recall of PQ landmarks vs exact
+f16 landmarks on clustered synthetic keys (mixture-of-Gaussians with drift — the
+structure real semantic pages exhibit); reports recall@k for pq16/pq8 and index bytes
+at 131K/512K/1M for the 8B and 70B profiles.
+
+**Honesty note.** PQ recall on synthetic clusters is an upper bound for adversarially
+uniform keys; the validator's `--hard` mode (near-isotropic keys) gives the floor. The
+coarse level assumes locality in page relevance — true for prose and code, weaker for
+random-access retrieval workloads.
+
+## 12. SPEC-PF — speculative page prefetch
+
+**Problem.** §8 fetches missed pages *on demand*: the fetch sits on the critical path
+of the attention op that needs it. At PCIe 3.0 a 4-page miss burst is ~1 ms — real
+latency once weights stop being the bottleneck (resident models, MAVM fleets).
+
+**Idea.** Attention page relevance has strong temporal locality: the top-k pages at
+step `t` predict most of the top-k at `t+1`. Keep the previous step's page scores as a
+prior, prefetch the predicted set on the *weight-streaming clock* (the upload queues
+already tick every layer), and demand-fetch only true surprises.
+
+**Validator** (`scripts/svmi-pageprefetch.py`): a trace simulator — sinks + local
+window always hit; distal accesses follow a persistent Zipf process with drift —
+measures prefetch hit-rate vs prefetch budget and the resulting reduction in
+critical-path fetch bytes/step. Typical regime: 70–90 % of misses hidden at a prefetch
+budget of 2× the average working set.
+
+**Honesty note.** Locality collapses on topic switches (hit-rate dips for a few steps)
+and the simulator's drift parameter is a guess until traced on real attention scores;
+wire `--trace` to a llama.cpp run before believing the third decimal.
+
+## 13. Cold-tier pruning — the attention-mass ledger
+
+**Problem.** CTX-VM keeps *every* token's KV in host RAM forever; at 256K × 32 agents
+the host RAM wall (§8's runs) is mostly tokens no head has attended to in thousands of
+steps (H2O/SnapKV observation: attention mass is heavy-tailed).
+
+**Idea.** Per page, accumulate the attention mass it received over the last N decode
+steps (4 bytes/page ledger — free). Pages below threshold demote: first to a q2 archive
+(landmark stays, fetch re-quantizes up), then out entirely under `--prune-cold`, with
+the page's landmark marked so exact modes know the history is incomplete.
+
+* Models 2–4× cold-tier shrink at 131K+ on prose workloads; the planner's
+  `--prune-cold F` shows the host-RAM wall moving accordingly.
+
+**Honesty note.** This is the one *lossy-by-design* technique in SVMI: a pruned page is
+unrecoverable. Ship it opt-in, default off, and never prune inside the exact-mode
+window. Needs a task-level eval (long-doc QA recall) before any default flips.
+
+## 14. Unified VRAM pool — one budget for ring and window
+
+**Problem.** The staging ring (§1) and the CTX-VM hot windows are sized statically and
+separately, but their demand is anti-correlated: prefill is ring-hungry (weights
+stream hard, attention is local), decode is window-hungry (weights amortize across the
+fleet, attention roams).
+
+**Idea.** One VRAM pool, re-split at phase boundaries: prefill borrows window budget
+for +2–4 ring slots (deeper overlap), decode returns it as +1–2K tokens of hot window
+per agent. No new allocations at runtime — the pool is pre-carved into page-sized
+blocks both consumers speak.
+
+The planner models the split implicitly today (`--stream-slots`, `--kv-window` are the
+static knobs); the engine change is an allocator, not new math, and reuses the slot
+machinery already in `ggml_backend_sched` (`ggml-backend.cpp`).
+
+## Second-wave priority
+
+1. **PQ landmarks (§11)** — pure index-side change, no numerics risk, unlocks 1M-token
+   page tables; validated by `svmi-pqindex.py` and the C++ reference test
+   (`tests/test-ctxvm-landmarks.cpp`).
+2. **SPEC-PF (§12)** — scheduler-only, composes with everything; simulator-validated.
+3. **KV-LAT (§10)** — biggest bytes win (multiplies §8 everywhere) but needs
+   calibration infrastructure; start with cold-tier-only deployment.
+4. **Unified pool (§14)** — allocator refactor, do it when §12 lands (same code area).
+5. **Cold pruning (§13)** — last: lossy, needs evals, and §10 shrinks the same bytes
+   losslessly-with-verification first.
+
+The composition target for the wave: a 70B fleet at **1M tokens of addressable context
+per agent** on a 12 GB card — 40 MiB index + 0.7 GiB window + latent cold tier in host
+RAM — with the same token-identity story as the first wave: approximate fast paths,
+exact verification available everywhere.

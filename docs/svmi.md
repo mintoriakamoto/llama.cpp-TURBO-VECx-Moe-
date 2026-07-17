@@ -103,6 +103,17 @@ the transport is scheduled differently.
   VRAM-resident share, CPU verifies the host share in speculative batches, PCIe carries
   zero weights on the critical path) and compares decode rate against streaming and
   stock partial offload. Names the binding resource at the optimum.
+- `scripts/svmi-kvlat.py` — **KV-LAT** rank study (second wave, §10): SVD spectra of
+  `[W_K; W_V]` from a real GGUF (or synthetic profile) → the latent rank a MLA-style
+  retrofit could cache instead of full GQA KV, and the bytes/token it buys.
+- `scripts/svmi-pqindex.py` — **CTX-VM v2** landmark compression study (§11): top-k
+  page recall of product-quantized landmarks vs f16, plus the index-size table that
+  makes 1M-token page tables fit (640 MiB → 40 MiB for a 70B at pq16).
+- `scripts/svmi-pageprefetch.py` — **SPEC-PF** simulator (§12): how much demand-fetch
+  latency speculative page prefetch hides, as a function of prefetch budget; its hit
+  rate feeds `svmi-fleet.py --prefetch-hit`. The fleet planner models the whole second
+  wave via `--kv-lat`, `--landmarks`, `--prefetch-hit`, and `--prune-cold`; the landmark
+  math itself is CI-guarded by `tests/test-ctxvm-landmarks.cpp`.
 
 ## Consumer GPUs (6–12 GB): 1660 Ti, RTX 2080 / 2080 Ti, RTX 3060
 
@@ -173,6 +184,9 @@ PCIe 4.0 x16 (~25 GB/s pinned):
 | 4 | compressed transport: entropy-coded quantized blocks, GPU rANS decode fused with dequant (`scripts/svmi-entropy.py` decides go/no-go) | next |
 | 5 | paged KV with host spill on the same DMA engine | planned |
 | 6 | predictive MoE expert paging (router-logit lookahead) | planned |
+| 7 | **second wave (July 2026)** — PQ landmarks + two-level page table (`scripts/svmi-pqindex.py`, `tests/test-ctxvm-landmarks.cpp`) | validated |
+| 8 | second wave — speculative page prefetch on the streaming clock (`scripts/svmi-pageprefetch.py`) | validated |
+| 9 | second wave — KV-LAT latent KV retrofit (`scripts/svmi-kvlat.py`), cold-tier ledger pruning, unified VRAM pool | designed |
 
 ---
 
