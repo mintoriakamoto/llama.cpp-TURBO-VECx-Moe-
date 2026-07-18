@@ -35,11 +35,18 @@ MODEL_PROFILES = {
     "13b": (40, 5120, 40, 40,  7.4),
     "70b": (80, 8192, 64,  8, 39.6),
 }
-GPU_PRESETS = {  # vram GiB, effective PCIe GB/s
+GPU_PRESETS = {  # vram GiB, effective PCIe GB/s (card's own link generation)
     "1660ti": (6, 12.0), "2060": (6, 12.0), "2070": (8, 12.0), "2080": (8, 12.0),
-    "2080ti": (11, 12.0), "3060": (12, 24.0), "3070": (8, 24.0), "3080": (10, 24.0),
-    "3090": (24, 24.0), "4070": (12, 24.0), "4090": (24, 24.0),
+    "2080ti": (11, 12.0),
+    "3060": (12, 24.0), "3060ti": (8, 24.0), "3070": (8, 24.0), "3080": (10, 24.0),
+    "3090": (24, 24.0),
+    "4060": (8, 12.0), "4060ti": (16, 12.0),   # x8 gen4 links
+    "4070": (12, 24.0), "4070ti": (12, 24.0), "4070tis": (16, 24.0),
+    "4080": (16, 24.0), "4090": (24, 24.0),
+    "5060ti": (16, 24.0), "5070": (12, 48.0), "5070ti": (16, 48.0),
+    "5080": (16, 48.0), "5090": (32, 48.0),
 }
+PCIE_BW = {"3.0-x8": 6.0, "3.0-x16": 12.0, "4.0-x8": 12.0, "4.0-x16": 24.0, "5.0-x16": 48.0}
 Q8_BPE = 1.0625
 
 
@@ -47,8 +54,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model", nargs="?", help="GGUF file (or use --profile)")
     ap.add_argument("--profile", choices=sorted(MODEL_PROFILES))
-    ap.add_argument("--gpu", choices=sorted(GPU_PRESETS), required=True)
+    ap.add_argument("--gpu", required=True,
+                    help="GPU preset, or comma list for mixed rigs (e.g. 3060ti,1660ti); "
+                         "known: " + ",".join(sorted(GPU_PRESETS)))
     ap.add_argument("--gpus", type=int, default=1, help="number of identical GPUs (layer split)")
+    ap.add_argument("--pcie", choices=sorted(PCIE_BW), default=None,
+                    help="platform link override (old boards cap new cards, e.g. 3.0-x16)")
     ap.add_argument("--ctx", type=int, default=8192, help="context length you actually need")
     ap.add_argument("--agents", type=int, default=1, help="concurrent agents/slots planned")
     ap.add_argument("--display-reserve", type=float, default=1.0)
@@ -83,12 +94,21 @@ def main() -> int:
     else:
         ap.error("provide a GGUF path or --profile")
 
-    vram, pcie = GPU_PRESETS[args.gpu]
-    n_gpu = max(1, args.gpus)
-    # desktop boards run two x16 slots at x8/x8: per-card link bandwidth halves,
-    # but uploads run in parallel, so AGGREGATE stays ~one full link
-    pcie_agg = pcie if n_gpu > 1 else pcie
-    budget = (n_gpu * vram - args.display_reserve) * GiB
+    gpu_names = [g.strip() for g in args.gpu.split(",") if g.strip()]
+    for g in gpu_names:
+        if g not in GPU_PRESETS:
+            ap.error(f"unknown GPU '{g}'; known: {', '.join(sorted(GPU_PRESETS))}")
+    if len(gpu_names) == 1 and args.gpus > 1:
+        gpu_names = gpu_names * args.gpus
+    cards = [GPU_PRESETS[g] for g in gpu_names]
+    n_gpu = len(gpu_names)
+    vram = sum(c[0] for c in cards)
+    # platform may cap the card's link (old boards); multi-card desktop slots run
+    # x8/x8 so uploads parallelize to ~one full link - use the slowest card's link
+    link = min(c[1] for c in cards)
+    pcie_agg = PCIE_BW[args.pcie] if args.pcie else link
+    mixed = len(set(gpu_names)) > 1
+    budget = (vram - args.display_reserve) * GiB
     head_dim = n_embd // n_head
     kv_tok = 2 * head_dim * n_head_kv * n_layer * Q8_BPE
     kv = kv_tok * args.ctx * args.agents
@@ -97,16 +117,20 @@ def main() -> int:
     fleet = args.agents > 1 or args.ctx > 32768
 
     print(f"model   : {name}  ({weights / GiB:.1f} GiB weights, {n_layer} layers)")
-    gpu_lbl = f"{n_gpu}x {args.gpu}" if n_gpu > 1 else args.gpu
-    print(f"gpu     : {gpu_lbl}  ({n_gpu * vram} GiB VRAM total, ~{pcie_agg:.0f} GB/s aggregate PCIe"
-          + (", assumes x8/x8 slots" if n_gpu > 1 else "") + ")")
+    gpu_lbl = "+".join(gpu_names) if mixed else (f"{n_gpu}x {gpu_names[0]}" if n_gpu > 1 else gpu_names[0])
+    print(f"gpu     : {gpu_lbl}  ({vram} GiB VRAM total, ~{pcie_agg:.0f} GB/s aggregate PCIe"
+          + (", platform-capped" if args.pcie else "") + ")")
+    if mixed:
+        print("warning : mixed cards - a layer split runs each token at the SLOWEST card's")
+        print("          pace for its share. Prefer asymmetric roles (brain on the big card,")
+        print("          worker/draft/embeddings on the small one) unless capacity forces a split.")
     print(f"need    : {weights / GiB:.1f} weights + {kv / GiB:.1f} KV (q8_0 @ {args.ctx:,} ctx "
           f"x {args.agents}) + {fixed / GiB:.1f} reserve = {need / GiB:.1f} GiB "
           f"vs {budget / GiB:.1f} budget\n")
 
     kvflags = "-fa on -ctk q8_0 -ctv q8_0"   # quantized V cache requires flash attention
     if n_gpu > 1:
-        split = ",".join(["1"] * n_gpu)
+        split = ",".join(str(c[0]) for c in cards)     # proportional to VRAM
         kvflags += f" --split-mode layer --tensor-split {split}"
     if need <= budget:
         print("regime  : RESIDENT — everything fits, no streaming needed")
@@ -116,7 +140,12 @@ def main() -> int:
         print(f"\n  llama-cli -m {model_arg} -ngl 999 --stream-weights 8 --stream-decode \\")
         print(f"            {kvflags} -c {args.ctx}")
         print("\n  exact resident/streamed split (-ot overrides), decode floor:")
-        print(f"    python3 scripts/svmi-plan.py {model_arg} --gpu {args.gpu} --ctx {args.ctx}")
+        print(f"    python3 scripts/svmi-plan.py {model_arg} --gpu {gpu_names[0]} --ctx {args.ctx}")
+    elif args.host_ram * GiB * 0.9 < weights:
+        print("regime  : DOES NOT FIT — too big for VRAM, and host RAM "
+              f"({args.host_ram:.0f} GiB) cannot pin {weights / GiB:.1f} GiB of weights for streaming")
+        print("          options: a smaller model/quant that fits VRAM, or more host RAM.")
+        print(f"          largest resident-friendly weights on this rig: ~{max(0.0, (budget - fixed) / GiB - 1.0):.1f} GiB + KV")
     else:
         streamed = max(weights * 0.05, need - budget)   # bytes/pass that do not fit resident
         floor = pcie_agg * 1e9 / streamed
@@ -124,15 +153,15 @@ def main() -> int:
         print(f"          PCIe decode floor ~{floor:.1f} tok/s, ~{floor * 7:.0f} with BitSpec-class speculation")
         print(f"\n  llama-cli -m {model_arg} -ngl 999 --stream-weights 8 --stream-decode \\")
         print(f"            {kvflags} -c {args.ctx}")
-        print(f"\n  split + floor detail : python3 scripts/svmi-plan.py {model_arg} --gpu {args.gpu}")
+        print(f"\n  split + floor detail : python3 scripts/svmi-plan.py {model_arg} --gpu {gpu_names[0]}")
         prof = args.profile or "70b"
         print(f"  CPU-assisted decode  : python3 scripts/svmi-arbiter.py --profile {prof} "
-              f"--gpu {args.gpu} --cpu ddr5-2ch --cores 16")
+              f"--gpu {gpu_names[0]} --cpu ddr5-2ch --cores 16")
     if fleet:
         print(f"\nfleet   : {args.agents} agent(s) @ {args.ctx:,} ctx — full-VRAM KV stops scaling here;")
         print("          plan capacity with CTX-VM paging (planner-level today, engine phase 5):")
         print(f"    python3 scripts/svmi-fleet.py {'--profile ' + args.profile if args.profile else model_arg} "
-              f"--gpu {args.gpu} --agents {args.agents} --ctx {args.ctx} \\")
+              f"--gpu {gpu_names[0]} --agents {args.agents} --ctx {args.ctx} \\")
         print("        --cold-kv-type q4_0 --landmarks pq16 --prefetch-hit 0.7")
     # --- max context on this rig, per engine-real KV mode ---
     # weights the KV must coexist with: full model when resident, else the
