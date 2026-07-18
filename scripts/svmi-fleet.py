@@ -74,6 +74,9 @@ def main() -> int:
     ap.add_argument("--profile", choices=sorted(MODEL_PROFILES),
                     help="synthetic Q4_K_M-class model profile instead of a GGUF")
     ap.add_argument("--gpu", choices=sorted(GPU_PRESETS), help="consumer GPU preset")
+    ap.add_argument("--gpus", type=int, default=1,
+                    help="number of identical GPUs (layer split: VRAM adds, PCIe aggregate "
+                         "~one full link on x8/x8 desktop slots, compute adds)")
     ap.add_argument("--vram-budget", type=float, help="usable VRAM GiB (overrides --gpu)")
     ap.add_argument("--pcie", choices=sorted(PCIE_BW), help="PCIe link (overrides --gpu)")
     ap.add_argument("--display-reserve", type=float, default=1.0)
@@ -115,10 +118,12 @@ def main() -> int:
     # resolve GPU
     n_queues = 2
     gpu_tflops = 0.0
+    n_gpu = max(1, args.gpus)
     if args.gpu:
         vram, link, n_queues, gpu_tflops = GPU_PRESETS[args.gpu]
+        gpu_tflops *= n_gpu                       # compute adds across cards
         if args.vram_budget is None:
-            args.vram_budget = max(0.0, vram - args.display_reserve)
+            args.vram_budget = max(0.0, n_gpu * vram - args.display_reserve)
         if args.pcie is None:
             args.pcie = link
     if args.vram_budget is None:
@@ -206,8 +211,9 @@ def main() -> int:
     print(f"model        : {model_name} ({arch}, {n_layer} layers, {total_w/GiB:.2f} GiB, "
           f"streamable {streamable_w/GiB:.2f})")
     if args.gpu:
-        print(f"gpu          : {args.gpu}  ({args.pcie}, {n_queues} H2D copy engine(s), "
-              f"{pcie_bw:.0f} GB/s eff)")
+        print(f"gpu          : {(str(n_gpu) + 'x ') if n_gpu > 1 else ''}{args.gpu}  ({args.pcie}, "
+              f"{n_queues} H2D copy engine(s), {pcie_bw:.0f} GB/s aggregate"
+              + (", x8/x8 slots assumed" if n_gpu > 1 else "") + ")")
     print(f"context      : {args.ctx:,} tok/agent ({shared_ctx:,} shared + {unique_ctx:,} unique), "
           f"kv {args.kv_type}" + (f"/{args.cold_kv_type} cold" if args.cold_kv_type else ""))
     print(f"kv mode      : {'CTX-VM paged' if paged else 'full-in-VRAM'}"

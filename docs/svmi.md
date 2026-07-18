@@ -359,6 +359,8 @@ hardware) — are written up with bandwidth math, honesty notes, and build prior
 ```sh
 # reads the model + GPU, picks the regime, prints ready-to-run flags
 python3 scripts/svmi-auto.py model.gguf --gpu 3060
+# multi-GPU rigs: --gpus N (layer split; VRAM adds, x8/x8 slot bandwidth assumed)
+python3 scripts/svmi-auto.py model.gguf --gpu 2080ti --gpus 2
 # or, CPU-assisted decode analysis directly:
 python3 scripts/svmi-arbiter.py --profile 70b --gpu 3060 --cpu ddr5-2ch --cores 16
 ```

@@ -48,6 +48,7 @@ def main() -> int:
     ap.add_argument("model", nargs="?", help="GGUF file (or use --profile)")
     ap.add_argument("--profile", choices=sorted(MODEL_PROFILES))
     ap.add_argument("--gpu", choices=sorted(GPU_PRESETS), required=True)
+    ap.add_argument("--gpus", type=int, default=1, help="number of identical GPUs (layer split)")
     ap.add_argument("--ctx", type=int, default=8192, help="context length you actually need")
     ap.add_argument("--agents", type=int, default=1, help="concurrent agents/slots planned")
     ap.add_argument("--display-reserve", type=float, default=1.0)
@@ -82,7 +83,11 @@ def main() -> int:
         ap.error("provide a GGUF path or --profile")
 
     vram, pcie = GPU_PRESETS[args.gpu]
-    budget = (vram - args.display_reserve) * GiB
+    n_gpu = max(1, args.gpus)
+    # desktop boards run two x16 slots at x8/x8: per-card link bandwidth halves,
+    # but uploads run in parallel, so AGGREGATE stays ~one full link
+    pcie_agg = pcie if n_gpu > 1 else pcie
+    budget = (n_gpu * vram - args.display_reserve) * GiB
     head_dim = n_embd // n_head
     kv_tok = 2 * head_dim * n_head_kv * n_layer * Q8_BPE
     kv = kv_tok * args.ctx * args.agents
@@ -91,12 +96,17 @@ def main() -> int:
     fleet = args.agents > 1 or args.ctx > 32768
 
     print(f"model   : {name}  ({weights / GiB:.1f} GiB weights, {n_layer} layers)")
-    print(f"gpu     : {args.gpu}  ({vram} GiB VRAM, ~{pcie:.0f} GB/s PCIe)")
+    gpu_lbl = f"{n_gpu}x {args.gpu}" if n_gpu > 1 else args.gpu
+    print(f"gpu     : {gpu_lbl}  ({n_gpu * vram} GiB VRAM total, ~{pcie_agg:.0f} GB/s aggregate PCIe"
+          + (", assumes x8/x8 slots" if n_gpu > 1 else "") + ")")
     print(f"need    : {weights / GiB:.1f} weights + {kv / GiB:.1f} KV (q8_0 @ {args.ctx:,} ctx "
           f"x {args.agents}) + {fixed / GiB:.1f} reserve = {need / GiB:.1f} GiB "
           f"vs {budget / GiB:.1f} budget\n")
 
     kvflags = "-ctk q8_0 -ctv q8_0"
+    if n_gpu > 1:
+        split = ",".join(["1"] * n_gpu)
+        kvflags += f" --split-mode layer --tensor-split {split}"
     if need <= budget:
         print("regime  : RESIDENT — everything fits, no streaming needed")
         print(f"\n  llama-cli -m {model_arg} -ngl 999 {kvflags} -c {args.ctx}")
@@ -107,7 +117,8 @@ def main() -> int:
         print("\n  exact resident/streamed split (-ot overrides), decode floor:")
         print(f"    python3 scripts/svmi-plan.py {model_arg} --gpu {args.gpu} --ctx {args.ctx}")
     else:
-        floor = pcie * 1e9 / max(1, weights * 0.9) if weights else 0.0
+        streamed = max(weights * 0.05, need - budget)   # bytes/pass that do not fit resident
+        floor = pcie_agg * 1e9 / streamed
         print("regime  : STREAMED — the model mostly lives in pinned host RAM (SVMI)")
         print(f"          PCIe decode floor ~{floor:.1f} tok/s, ~{floor * 7:.0f} with BitSpec-class speculation")
         print(f"\n  llama-cli -m {model_arg} -ngl 999 --stream-weights 8 --stream-decode \\")
@@ -122,6 +133,9 @@ def main() -> int:
         print(f"    python3 scripts/svmi-fleet.py {'--profile ' + args.profile if args.profile else model_arg} "
               f"--gpu {args.gpu} --agents {args.agents} --ctx {args.ctx} \\")
         print("        --cold-kv-type q4_0 --landmarks pq16 --prefetch-hit 0.7")
+    if n_gpu > 1:
+        print("\nmulti-gpu: layer split shown (safest); 2080 Ti-class pairs with an NVLink")
+        print("bridge can try --split-mode row for tensor parallelism on the resident share.")
     print("\nverify any streamed setup with scripts/svmi-verify.sh (token identity) before trusting it.")
     return 0
 
