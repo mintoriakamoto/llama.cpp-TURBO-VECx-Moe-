@@ -53,6 +53,7 @@ def main() -> int:
     ap.add_argument("--agents", type=int, default=1, help="concurrent agents/slots planned")
     ap.add_argument("--display-reserve", type=float, default=1.0)
     ap.add_argument("--overhead", type=float, default=1.25, help="activation reserve GiB")
+    ap.add_argument("--host-ram", type=float, default=64.0, help="host RAM GiB (for the -nkvo ceiling)")
     args = ap.parse_args()
 
     if args.model:
@@ -103,7 +104,7 @@ def main() -> int:
           f"x {args.agents}) + {fixed / GiB:.1f} reserve = {need / GiB:.1f} GiB "
           f"vs {budget / GiB:.1f} budget\n")
 
-    kvflags = "-ctk q8_0 -ctv q8_0"
+    kvflags = "-fa on -ctk q8_0 -ctv q8_0"   # quantized V cache requires flash attention
     if n_gpu > 1:
         split = ",".join(["1"] * n_gpu)
         kvflags += f" --split-mode layer --tensor-split {split}"
@@ -133,6 +134,29 @@ def main() -> int:
         print(f"    python3 scripts/svmi-fleet.py {'--profile ' + args.profile if args.profile else model_arg} "
               f"--gpu {args.gpu} --agents {args.agents} --ctx {args.ctx} \\")
         print("        --cold-kv-type q4_0 --landmarks pq16 --prefetch-hit 0.7")
+    # --- max context on this rig, per engine-real KV mode ---
+    # weights the KV must coexist with: full model when resident, else the
+    # non-streamable floor (embeddings/norms/head, ~5%) since SVMI pages the rest
+    w_gpu = weights if weights + fixed <= budget else weights * 0.05
+    kv_room_vram = max(0.0, budget - w_gpu - fixed)
+    host_room = max(0.0, args.host_ram * GiB * 0.85 - (weights if w_gpu < weights else 0))
+    kv_tok1 = kv_tok / Q8_BPE            # per-token bytes at 1.0 bpe, single agent basis
+    per = args.agents
+    print("\nmax ctx : engine-real modes on this rig"
+          + (f" ({args.agents} agents)" if per > 1 else "") + ":")
+    for label, bpe, room, flags in (
+        ("f16 KV, VRAM",  2.0,    kv_room_vram, "-fa on"),
+        ("q8_0 KV, VRAM", 1.0625, kv_room_vram, "-fa on -ctk q8_0 -ctv q8_0"),
+        ("q4_0 KV, VRAM", 0.5625, kv_room_vram, "-fa on -ctk q4_0 -ctv q4_0"),
+        ("q4_0 KV, host RAM", 0.5625, host_room, "-fa on -ctk q4_0 -ctv q4_0 -nkvo (slower/step)"),
+    ):
+        cmax = int(room / (kv_tok1 * bpe * per))
+        print(f"  {label:<18} ~{cmax:>9,} tok   {flags}")
+    print("  beyond training ctx: --rope-scaling yarn --yarn-orig-ctx <train-ctx>; long")
+    print("  sessions reuse the window via --cache-reuse / context shift; SWA models cap")
+    print("  KV at their window (--swa-full disables). CTX-VM paging past all of these")
+    print("  is planner-level today (svmi-fleet.py).")
+
     if n_gpu > 1:
         print("\nmulti-gpu: layer split shown (safest); 2080 Ti-class pairs with an NVLink")
         print("bridge can try --split-mode row for tensor parallelism on the resident share.")
