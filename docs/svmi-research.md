@@ -493,3 +493,34 @@ The composition target for the wave: a 70B fleet at **1M tokens of addressable c
 per agent** on a 12 GB card — 40 MiB index + 0.7 GiB window + latent cold tier in host
 RAM — with the same token-identity story as the first wave: approximate fast paths,
 exact verification available everywhere.
+
+## 15. MoE-EP — predictive expert paging (phase 6, validated)
+
+**Problem.** MoE checkpoints put most of their bytes in experts the average token never
+touches: a Mixtral-class 8x7B carries 42 GiB of experts and activates 2/8 per layer; a
+DeepSeek-V3-class model carries ~200 GiB and activates 8/256. The generic SVMI streamer
+(§1) already pages experts *by demand* — but demand arrives when the router fires, one
+layer before the bytes are needed, which is exactly the window prefetch needs.
+
+**Idea.** Three residency policies, in ascending order of intelligence:
+
+1. **static** — pin the globally popular experts (Zipf head), stream the tail;
+2. **LRU** — page experts on use, evict least-recently-used (temporal stickiness pays);
+3. **lookahead** — LRU + prefetch the *predicted* set from the router's early signal
+   (previous layer's hidden state is a strong predictor of the next layer's routing),
+   riding the same upload queues as §1, off the critical path.
+
+**Validation** (`scripts/svmi-expertpage.py`, trace-model simulator, honesty knob
+`--lookahead-hit`, default 0.7):
+
+* Mixtral-8x7B-class on a 3060: 6.6 experts fetched on the critical path per token
+  under lookahead vs 64 with no residency — **9.7×** less critical-path PCIe.
+* Qwen3-30B-A3B-class (128 fine experts): **24.9×**; fine-grained expert grids page
+  dramatically better because each miss is only 2.8 MiB.
+
+**Honesty notes.** (a) The lookahead hit rate is *assumed*, not measured — wire the
+simulator's trace mode to real router logits before quoting the multiplier. (b) The
+popularity/stickiness parameters are literature-shaped, not fitted; batch serving
+flattens popularity (more distinct experts per step) and lowers all policies toward
+`none`. (c) Engine-side, this is the same staging-ring machinery as §1 — the new code
+is the predictor and the eviction policy, not the transport.

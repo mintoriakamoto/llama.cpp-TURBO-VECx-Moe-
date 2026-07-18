@@ -114,6 +114,12 @@ the transport is scheduled differently.
   rate feeds `svmi-fleet.py --prefetch-hit`. The fleet planner models the whole second
   wave via `--kv-lat`, `--landmarks`, `--prefetch-hit`, and `--prune-cold`; the landmark
   math itself is CI-guarded by `tests/test-ctxvm-landmarks.cpp`.
+- `scripts/svmi-expertpage.py` — **MoE-EP** expert-paging simulator (§15, roadmap
+  phase 6): compares static / LRU / router-lookahead expert residency by critical-path
+  PCIe bytes per token on MoE profiles (Mixtral-8x7B, Qwen3-30B-A3B, DeepSeek-V3 class).
+- `scripts/svmi-auto.py` — the **one command**: reads the model + GPU, picks the regime
+  (resident / offload / streamed / fleet), prints ready-to-run flags that exist in this
+  branch today, and names the specialist planner for fine-tuning.
 
 ## Consumer GPUs (6–12 GB): 1660 Ti, RTX 2080 / 2080 Ti, RTX 3060
 
@@ -183,7 +189,7 @@ PCIe 4.0 x16 (~25 GB/s pinned):
 | 3 | offload-aware speculative decoding — **BitSpec**: a low-bit resident copy of the model's own weights is the draft, verified per stream pass (validated: `scripts/svmi-bitspec.py`, see [svmi-research.md](svmi-research.md)) | next |
 | 4 | compressed transport: entropy-coded quantized blocks, GPU rANS decode fused with dequant (`scripts/svmi-entropy.py` decides go/no-go) | next |
 | 5 | paged KV with host spill on the same DMA engine | planned |
-| 6 | predictive MoE expert paging (router-logit lookahead) | planned |
+| 6 | predictive MoE expert paging (router-logit lookahead) — **MoE-EP** (`scripts/svmi-expertpage.py`, §15) | validated |
 | 7 | **second wave (July 2026)** — PQ landmarks + two-level page table (`scripts/svmi-pqindex.py`, `tests/test-ctxvm-landmarks.cpp`) | validated |
 | 8 | second wave — speculative page prefetch on the streaming clock (`scripts/svmi-pageprefetch.py`) | validated |
 | 9 | second wave — KV-LAT latent KV retrofit (`scripts/svmi-kvlat.py`), cold-tier ledger pruning, unified VRAM pool | designed |
@@ -348,10 +354,12 @@ hardware) — are written up with bandwidth math, honesty notes, and build prior
 `scripts/svmi-bitspec.py` (BitSpec), `scripts/svmi-fleet.py` (MAVM + CTX-VM), and
 `scripts/svmi-arbiter.py` (ARBITER).
 
-### What should this machine do with a model that doesn't fit? (one command)
+### What should this machine do with this model? (one command)
 
 ```sh
-# 70B on a 12 GB RTX 3060 with a DDR5 desktop CPU
+# reads the model + GPU, picks the regime, prints ready-to-run flags
+python3 scripts/svmi-auto.py model.gguf --gpu 3060
+# or, CPU-assisted decode analysis directly:
 python3 scripts/svmi-arbiter.py --profile 70b --gpu 3060 --cpu ddr5-2ch --cores 16
 ```
 
