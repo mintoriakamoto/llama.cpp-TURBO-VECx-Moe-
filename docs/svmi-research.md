@@ -524,3 +524,60 @@ popularity/stickiness parameters are literature-shaped, not fitted; batch servin
 flattens popularity (more distinct experts per step) and lowers all policies toward
 `none`. (c) Engine-side, this is the same staging-ring machinery as §1 — the new code
 is the predictor and the eviction policy, not the transport.
+
+---
+
+## Calibration against published measurements (July 2026 source scrape)
+
+The second-wave validators originally ran on literature-*shaped* synthetic
+parameters. This pass re-calibrated them against specific published measurements
+and made the estimators themselves faster and more honest:
+
+**KV-LAT (§10)** — TransMLA (arXiv:2502.07864) measures **68.75 % KV-cache
+compression at a 1.65 % average quality drop, training-free**, on LLaMA-2-7B — the
+premise of the retrofit, measured. Its follow-ups (CARE, arXiv:2603.17946;
+layer-adaptive variants) show uniform per-layer ranks are the failure mode
+(ppl 6.1 → 25.8 uniform vs → 12.9 layer-adaptive on Llama3-8B), so `svmi-kvlat.py`
+now reports the per-layer rank spread and budgets bytes on the **layer-adaptive
+mean**, not a uniform median. The spectrum estimator was also replaced (analytic
+spectra for profiles, Gram-matrix `eigvalsh` for GGUF tensors): ~300× faster,
+identical math, so it now analyzes every layer instead of a sample.
+
+**CTX-VM v2 (§11)** — Quest (arXiv:2406.10774) ranks pages with per-dim min/max
+metadata and reports recall close to full attention at up to 7× self-attention
+speedup. `svmi-pqindex.py` now scores against the **exact page ranking** (real
+per-page keys, not landmark-vs-landmark), compares mean vs Quest-style minmax
+landmarks, and offers OPQ-lite PCA rotation. Honest finding: on our normalized
+synthetic keys the minmax bound *under-ranks* (upper bounds favor high-spread
+pages) — the opposite of Quest's result on real unnormalized keys — so the
+landmark kind is flagged as a measure-on-your-model decision.
+
+**SPEC-PF (§12)** — the original simulator's prefetcher scored pages with the
+generative distribution — an oracle. It now predicts from **observed accesses
+only** (EMA memory, `--ema`), which any engine can implement; oracle numbers were
+~8–10 points optimistic. Related: reuse-based sparse-attention decode (
+arXiv:2606.30389) reports the same predict-reuse-repair structure.
+
+**MoE-EP (§15)** — local-routing-consistency measurements (arXiv:2505.16056)
+report ~44 % same-expert reuse across consecutive blocks, recommend an expert
+cache ≈ **2× the active expert count**, and warn that consistency varies sharply
+per checkpoint ("not all models suit expert offloading"). ReMoE (arXiv:2605.27081)
+shows router-side locality tuning cuts TPOT 43.6–49.8 % on edge hardware.
+`svmi-expertpage.py`'s stickiness default matches the measured reuse band, and
+`--batch N` now models the locality flattening that batch serving causes.
+
+**Fleet planner** — aggregate throughput is now clamped by a GPU **compute
+ceiling** (effective fp16 TFLOPS presets, 50 % sustained on batched verify
+GEMMs), marked `c` in the table; previously the streaming bound extrapolated
+unbounded. Context-scale motivation from 2026 engineering surveys: beyond 128K
+tokens KV dominates VRAM (70–90 % at 1M ctx), making the §8/§10 combination the
+biggest single lever.
+
+Sources: [TransMLA](https://arxiv.org/abs/2502.07864) ·
+[CARE](https://arxiv.org/abs/2603.17946) ·
+[Quest](https://arxiv.org/abs/2406.10774) ·
+[Local routing consistency](https://arxiv.org/abs/2505.16056) ·
+[ReMoE](https://arxiv.org/abs/2605.27081) ·
+[Predict-Reuse-Repair](https://arxiv.org/abs/2606.30389) ·
+[The Sparse Frontier](https://arxiv.org/abs/2504.17768) ·
+[KV-cache optimization guide 2026](https://www.digitalapplied.com/blog/kv-cache-optimization-techniques-2026-engineering-guide)

@@ -32,6 +32,7 @@ def run_sim(args, rng: np.random.Generator):
     zipf = 1.0 / np.arange(1, n + 1) ** args.zipf
     prev_hot: set[int] = set()
     prefetched: set[int] = set()
+    ema = np.zeros(n)                                  # multi-step score memory
     demand_misses = prefetch_hits = total_distal = 0
 
     for _ in range(args.steps):
@@ -54,8 +55,12 @@ def run_sim(args, rng: np.random.Generator):
             else:
                 demand_misses += 1
 
-        # prefetcher: predict from this step's accesses + score prior, budget-limited
-        order = np.argsort(-pop)
+        # prefetcher: EMA over observed accesses beats last-step-only prediction
+        # (persistent pages accumulate weight; one-off touches decay away)
+        obs = np.zeros(n)
+        obs[list(accessed)] = 1.0
+        ema = args.ema * ema + (1.0 - args.ema) * obs
+        order = np.argsort(-ema)
         prefetched = set(order[: args.budget].tolist()) | accessed
         prev_hot = accessed
 
@@ -71,6 +76,8 @@ def main() -> int:
     ap.add_argument("--sticky", type=float, default=0.5, help="temporal persistence strength")
     ap.add_argument("--drift", type=float, default=0.01, help="topic-switch probability per step")
     ap.add_argument("--page-tokens", type=int, default=256)
+    ap.add_argument("--ema", type=float, default=0.8,
+                    help="predictor memory: 0 = last step only, ->1 = long history")
     ap.add_argument("--kv-bytes-tok", type=float, default=96.0,
                     help="cold KV bytes/token/layer-sum fetched (q4 70B latent ~96)")
     ap.add_argument("--seed", type=int, default=7)
@@ -78,7 +85,7 @@ def main() -> int:
 
     rng = np.random.default_rng(args.seed)
     print(f"pages {args.pages}, {args.distal} distal accesses/step, zipf {args.zipf}, "
-          f"sticky {args.sticky}, drift {args.drift}\n")
+          f"sticky {args.sticky}, drift {args.drift}, predictor ema {args.ema}\n")
     print(f"{'prefetch budget':>15} {'hit rate':>9} {'demand tok/step':>16} {'hidden':>7}")
 
     base_tokens = args.distal * args.page_tokens
@@ -91,7 +98,9 @@ def main() -> int:
 
     print(f"\nbaseline demand fetch: {base_tokens} tok/step "
           f"({base_tokens * args.kv_bytes_tok / 1e6:.1f} MB/step at {args.kv_bytes_tok:.0f} B/tok)")
-    print("notes: hit rate at your chosen budget is the planner input (--prefetch-hit H);")
+    print("notes: the predictor sees only OBSERVED accesses (EMA over hits - implementable),")
+    print("not the generative distribution; oracle predictors look ~8-10 points better and")
+    print("are not real. Hit rate at your chosen budget is the planner input (--prefetch-hit H);")
     print("prefetch bandwidth rides the weight-stream queues off the critical path, so")
     print("hidden fetches cost bandwidth but not latency. Drift spikes cause short dips -")
     print("size the budget for the post-switch regime, not the steady state. Replace this")

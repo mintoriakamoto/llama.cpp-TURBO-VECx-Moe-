@@ -92,7 +92,11 @@ def main() -> int:
                     help="VRAM for resident experts (default: what the GPU leaves free)")
     ap.add_argument("--tokens", type=int, default=2000, help="tokens simulated")
     ap.add_argument("--zipf", type=float, default=1.05, help="expert popularity skew")
-    ap.add_argument("--sticky", type=float, default=0.35, help="token-to-token expert reuse")
+    ap.add_argument("--sticky", type=float, default=0.35,
+                    help="token-to-token expert reuse (default tuned to published ~40-45%% "
+                         "consecutive-block reuse; varies strongly per model)")
+    ap.add_argument("--batch", type=int, default=1,
+                    help="concurrent sequences: batching flattens locality (sticky/=batch)")
     ap.add_argument("--drift", type=float, default=0.002, help="per-layer topic-switch prob/token")
     ap.add_argument("--lookahead-hit", type=float, default=0.7,
                     help="fraction of misses the router-logit prefetch hides (honesty knob)")
@@ -108,6 +112,7 @@ def main() -> int:
     total_res = int(args.resident_gib * GiB / exp_bytes)
     args.resident_experts = max(top_k, total_res // n_layer)
 
+    args.sticky = args.sticky / max(1, args.batch)   # batches interleave topics
     total_experts_gib = n_layer * n_expert * exp_bytes / GiB
     rng = np.random.default_rng(args.seed)
     res = simulate(n_layer, n_expert, top_k, args, rng)
@@ -136,6 +141,11 @@ def main() -> int:
     print("--lookahead-hit; trace it on a real model before believing it. Fetches share")
     print("the SVMI upload queues, so hidden misses cost bandwidth but not latency.")
     print("PCIe-bound tok/s ignores compute; the real rate is min(this, compute rate).")
+    print("Published measurements: ~44% same-expert reuse across consecutive blocks, and")
+    print("a cache of ~2x the active expert count for robust hit rates - but routing")
+    print("consistency varies per checkpoint ('not all models suit expert offloading');")
+    print("measure YOUR model's reuse before sizing residency. Batch serving flattens")
+    print("locality: rerun with --batch N for served workloads.")
     return 0
 
 

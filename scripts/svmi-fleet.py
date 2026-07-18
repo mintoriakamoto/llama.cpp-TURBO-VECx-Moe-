@@ -44,13 +44,15 @@ from pathlib import Path
 GiB = 1024**3
 
 PCIE_BW = {"3.0-x8": 6.0, "3.0-x16": 12.0, "4.0-x8": 12.0, "4.0-x16": 24.0, "5.0-x16": 48.0}
-# (vram GiB, pcie link, copy engines)
+# (vram GiB, pcie link, copy engines, effective dense fp16 TFLOPS)
 GPU_PRESETS = {
-    "1660ti": (6, "3.0-x16", 1), "2060": (6, "3.0-x16", 1), "2070": (8, "3.0-x16", 1),
-    "2080": (8, "3.0-x16", 1), "2080ti": (11, "3.0-x16", 1),
-    "3060": (12, "4.0-x16", 2), "3070": (8, "4.0-x16", 2), "3080": (10, "4.0-x16", 2),
-    "3090": (24, "4.0-x16", 2), "4070": (12, "4.0-x16", 2), "4090": (24, "4.0-x16", 2),
+    "1660ti": (6, "3.0-x16", 1, 5.0), "2060": (6, "3.0-x16", 1, 10.0), "2070": (8, "3.0-x16", 1, 12.0),
+    "2080": (8, "3.0-x16", 1, 16.0), "2080ti": (11, "3.0-x16", 1, 22.0),
+    "3060": (12, "4.0-x16", 2, 13.0), "3070": (8, "4.0-x16", 2, 20.0), "3080": (10, "4.0-x16", 2, 30.0),
+    "3090": (24, "4.0-x16", 2, 36.0), "4070": (12, "4.0-x16", 2, 29.0), "4090": (24, "4.0-x16", 2, 82.0),
 }
+Q4KM_BYTES_PARAM = 0.56       # ~bytes/param of a Q4_K_M-class quant (param count estimate)
+GEMM_UTIL = 0.5               # sustained fraction of peak on batched verify GEMMs
 KV_BPE = {"f16": 2.0, "q8_0": 1.0625, "q5_1": 0.75, "q4_0": 0.5625}
 # landmark bytes per (page, layer, kv-head): f16 vector vs product-quantized codes (§11)
 LANDMARK_BYTES = {"f16": None, "pq32": 32, "pq16": 16, "pq8": 8}   # None -> head_dim*2
@@ -112,8 +114,9 @@ def main() -> int:
 
     # resolve GPU
     n_queues = 2
+    gpu_tflops = 0.0
     if args.gpu:
-        vram, link, n_queues = GPU_PRESETS[args.gpu]
+        vram, link, n_queues, gpu_tflops = GPU_PRESETS[args.gpu]
         if args.vram_budget is None:
             args.vram_budget = max(0.0, vram - args.display_reserve)
         if args.pcie is None:
@@ -257,14 +260,23 @@ def main() -> int:
             agg_s, per_s = "resident", "—"
         else:
             agg = pcie_bw * 1e9 / bytes_per_pass * n * args.bitspec_tokens
-            agg_s, per_s = f"{agg:8.1f}", f"{agg/n:8.1f}"
+            mark = ""
+            if gpu_tflops > 0:
+                params_est = total_w / Q4KM_BYTES_PARAM
+                ceiling = GEMM_UTIL * gpu_tflops * 1e12 / (2.0 * params_est)
+                if agg > ceiling:                 # streaming stops binding; FLOPs do
+                    agg, mark = ceiling, "c"
+            agg_s, per_s = f"{agg:8.1f}{mark}", f"{agg/n:8.1f}"
         print(f"{n:>6} {resident_w/GiB:9.2f}G {streamed_w/GiB:9.2f}G {kv_vram/GiB:7.2f}G "
               f"{host/GiB:7.0f}G {'yes':>6} {agg_s:>10} {per_s:>9}")
 
     print("\n* aggregate decode tok/s, streaming-bound region: one PCIe pass over streamed "
           "weights serves all agents\n  (stream-once-serve-many), x BitSpec mean "
-          f"{args.bitspec_tokens:.0f} tok/pass, minus paged-KV fetch traffic; plateaus when "
-          "compute binds.")
+          f"{args.bitspec_tokens:.0f} tok/pass, minus paged-KV fetch traffic; 'c' marks rows\n"
+          "  clamped at the GPU compute ceiling "
+          + (f"(~{GEMM_UTIL * gpu_tflops * 1e12 / (2.0 * total_w / Q4KM_BYTES_PARAM):,.0f} tok/s "
+             f"aggregate at {GEMM_UTIL:.0%} of {gpu_tflops:.0f} TF fp16)." if gpu_tflops > 0
+             else "(unknown GPU: give --gpu for the FLOPs clamp)."))
 
     print("\n-- economics --")
     print(f"marginal agent : {kv_vram_agent/GiB:.2f} GiB VRAM + {kv_host_agent/GiB:.2f} GiB host "

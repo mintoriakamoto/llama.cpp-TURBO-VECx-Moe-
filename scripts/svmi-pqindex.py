@@ -8,8 +8,13 @@ landmarks with product quantization costs in top-k page recall, on synthetic key
 the clustered structure real semantic pages exhibit (mixture of Gaussians + drift),
 and prints the index-size table that motivates the whole exercise.
 
-Recall here is agreement with the *f16-landmark* ranking (the §8 baseline), not with
-dense attention — PQ can only lose what the landmark abstraction already kept.
+Ground truth is the EXACT page ranking (max query-key dot over the page's real keys),
+so the table shows both losses at once: what the landmark abstraction gives up, and
+what PQ-compressing the landmark gives up on top. Two landmark kinds are compared:
+  mean    one normalized mean key per page (§8 baseline)
+  minmax  Quest-style per-dim min/max bound (2 vectors; upper-bounds the page score,
+          which is why Quest-class systems report recall close to full attention)
+PCA-rotating keys before PQ (--rotate, OPQ-lite) tightens the codes further.
 
 Usage:
   python3 scripts/svmi-pqindex.py                          # defaults: 512 pages, d=128
@@ -30,16 +35,19 @@ CTX_POINTS = (131072, 524288, 1048576)
 PAGE_TOKENS = 256
 
 
+KEYS_PAGE = 16   # keys simulated per page (subsampled: recall stabilizes fast)
+
+
 def make_pages(n_pages: int, dim: int, hard: bool, rng: np.random.Generator):
-    """Per-page landmark vectors: clustered with drift (default) or near-isotropic."""
+    """Per-page KEY sets: clustered with drift (default) or near-isotropic."""
     if hard:
-        landmarks = rng.standard_normal((n_pages, dim))
+        keys = rng.standard_normal((n_pages, KEYS_PAGE, dim))
     else:
         n_clusters = max(4, n_pages // 32)
         centers = rng.standard_normal((n_clusters, dim)) * 2.0
         assign = np.sort(rng.integers(0, n_clusters, n_pages))  # sorted = topical drift
-        landmarks = centers[assign] + 0.6 * rng.standard_normal((n_pages, dim))
-    return landmarks / np.linalg.norm(landmarks, axis=1, keepdims=True)
+        keys = centers[assign][:, None, :] + 0.6 * rng.standard_normal((n_pages, KEYS_PAGE, dim))
+    return keys / np.linalg.norm(keys, axis=2, keepdims=True)
 
 
 def pq_train(x: np.ndarray, m: int, rng: np.random.Generator, iters: int = 12):
@@ -83,35 +91,58 @@ def main() -> int:
     ap.add_argument("--queries", type=int, default=256, help="query vectors to average over")
     ap.add_argument("--topk", type=int, default=8, help="pages fetched per step")
     ap.add_argument("--hard", action="store_true", help="near-isotropic keys (worst case)")
+    ap.add_argument("--rotate", action="store_true", help="PCA-rotate before PQ (OPQ-lite)")
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    landmarks = make_pages(args.pages, args.dim, args.hard, rng)
+    keys = make_pages(args.pages, args.dim, args.hard, rng)          # (pages, keys, dim)
+    mean_lm = keys.mean(axis=1)
+    mean_lm /= np.linalg.norm(mean_lm, axis=1, keepdims=True)
+    kmin, kmax = keys.min(axis=1), keys.max(axis=1)                  # Quest bounds
+
     # queries live near existing content (attention looks things up, not random points)
-    src = landmarks[rng.integers(0, args.pages, args.queries)]
+    src = keys[rng.integers(0, args.pages, args.queries), rng.integers(0, KEYS_PAGE, args.queries)]
     queries = src + 0.4 * rng.standard_normal((args.queries, args.dim))
     queries /= np.linalg.norm(queries, axis=1, keepdims=True)
 
-    exact = queries @ landmarks.T
+    # EXACT ground truth: best key dot product in each page
+    exact = np.einsum("qd,pkd->qpk", queries, keys).max(axis=2)
     exact_rank = np.argsort(-exact, axis=1)
 
+    # landmark rankings
+    s_mean = queries @ mean_lm.T
+    # Quest bound: sum_d max(q_d*min_d, q_d*max_d) - vectorized over pages
+    s_minmax = np.maximum(queries[:, None, :] * kmin[None], queries[:, None, :] * kmax[None]).sum(axis=2)
+
+    if args.rotate:                                  # OPQ-lite: PCA basis before PQ
+        _, _, vt = np.linalg.svd(mean_lm - mean_lm.mean(0), full_matrices=False)
+        rot = vt.T
+    else:
+        rot = np.eye(args.dim)
+    pq_input = mean_lm @ rot
+
     print(f"pages {args.pages} ({args.pages * PAGE_TOKENS:,} tokens), dim {args.dim}, "
-          f"top-{args.topk}, {'HARD isotropic' if args.hard else 'clustered'} keys\n")
-    print(f"{'index':>7} {'bytes/head/page':>15} {'recall@k':>9} {'recall@2k':>10}")
+          f"top-{args.topk}, {'HARD isotropic' if args.hard else 'clustered'} keys, "
+          f"{'PCA-rotated' if args.rotate else 'unrotated'} PQ\n")
+    print(f"{'index':>7} {'bytes/head/page':>15} {'recall@k':>9} {'recall@2k':>10}   (vs EXACT page ranking)")
+    for label, sc, nbytes in (("mean", s_mean, args.dim * 2), ("minmax", s_minmax, args.dim * 4)):
+        rank = np.argsort(-sc, axis=1)
+        r1 = float(np.mean([recall_at_k(exact_rank[i], rank[i], args.topk) for i in range(args.queries)]))
+        r2 = float(np.mean([recall_at_k(exact_rank[i], rank[i], 2 * args.topk) for i in range(args.queries)]))
+        print(f"{label:>7} {nbytes:>15} {r1:>9.3f} {r2:>10.3f}   f16 landmark")
     for label, m in (("pq32", 32), ("pq16", 16), ("pq8", 8)):
         if args.dim % m:
             continue
-        codebooks, codes = pq_train(landmarks, m, rng)
+        codebooks, codes = pq_train(pq_input, m, rng)
         r1 = r2 = 0.0
         for i in range(args.queries):
-            s = pq_scores(queries[i], codebooks, codes)
+            s = pq_scores(queries[i] @ rot, codebooks, codes)
             ar = np.argsort(-s)
             r1 += recall_at_k(exact_rank[i], ar, args.topk)
             r2 += recall_at_k(exact_rank[i], ar, 2 * args.topk)
         r1, r2 = r1 / args.queries, r2 / args.queries
-        print(f"{label:>7} {m:>15} {r1:>9.3f} {r2:>10.3f}")
-    print(f"{'f16':>7} {args.dim * 2:>15} {'1.000':>9} {'1.000':>10}   (baseline)")
+        print(f"{label:>7} {m:>15} {r1:>9.3f} {r2:>10.3f}   PQ of mean landmark")
 
     def fmt(b: float) -> str:
         return f"{b / 1024**2:7.0f}M"
@@ -127,10 +158,13 @@ def main() -> int:
             pq8 = pages * n_layer * n_head_kv * 8
             print(f"{pname:>6} {ctx:>10,} {fmt(f16):>9} {fmt(pq16):>9} {fmt(pq8):>9}")
 
-    print("\nnotes: recall is vs f16-landmark ranking; over-fetching (recall@2k) recovers")
-    print("most residual misses at 2x fetch cost. Codebooks add ~256*dim*2 bytes/layer")
-    print("(shared across pages - negligible). Feed the planner: svmi-fleet.py")
-    print("--landmarks pq16. Floor-case check: rerun with --hard.")
+    print("\nnotes: recall is vs the EXACT page ranking, so the mean/minmax rows show the")
+    print("landmark abstraction's own loss - PQ costs almost nothing on top of it, and")
+    print("over-fetch (recall@2k) recovers most of the rest at 2x fetch cost. On THIS")
+    print("synthetic distribution the Quest-style minmax bound under-ranks (upper bounds")
+    print("favor high-spread pages); Quest measures the opposite on real unnormalized")
+    print("keys, so trace real K tensors before choosing a landmark kind. --rotate")
+    print("(OPQ-lite) tightens the smallest codes. Planner: svmi-fleet.py --landmarks pq16.")
     return 0
 
 
