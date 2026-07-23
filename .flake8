@@ -4,6 +4,8 @@ ignore = E203,E211,E221,E225,E231,E241,E251,E261,E266,E501,E701,E704,W503
 per-file-ignores =
     # SVMI planner CLIs write their reports to stdout by design
     scripts/svmi-*.py: NP100
+    # ported prism test-fixture generator prints its progress to stdout
+    tests/gen-tiny-qwen35.py: NP100
 exclude =
     # Do not traverse examples and tools
     examples,
