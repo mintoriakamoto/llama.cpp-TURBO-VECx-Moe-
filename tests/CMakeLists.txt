@@ -192,6 +192,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+    llama_build_and_test(test-kv-mean-center.cpp)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
@@ -253,6 +254,43 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 llama_build_and_test(test-recurrent-state-rollback.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# Rotating recurrent-state snapshot ring (n_rs_seq). This needs a recurrent
+# (hybrid GDN) model to exercise rollback; the shared stories model is
+# non-recurrent, so pointing the test at it makes it self-skip and the ring is
+# never covered in CI. Generate a tiny qwen35 fixture with the pure-Python
+# (numpy + gguf) generator when it is importable and require it; otherwise fall
+# back to the stories model (the test self-skips) so a toolchain without
+# numpy/gguf still configures and builds unchanged.
+set(RS_RING_MODEL "${MODEL_DEST}")
+set(RS_RING_FIXTURE "test-download-model")
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_Interpreter_FOUND)
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${CMAKE_SOURCE_DIR}/gguf-py"
+                ${Python3_EXECUTABLE} -c "import numpy, gguf"
+        RESULT_VARIABLE RS_RING_PY_OK
+        OUTPUT_QUIET ERROR_QUIET)
+    if (RS_RING_PY_OK EQUAL 0)
+        set(TINY_QWEN35_DEST "${CMAKE_BINARY_DIR}/tiny-qwen35.gguf")
+        add_test(NAME test-gen-tiny-qwen35
+            COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${CMAKE_SOURCE_DIR}/gguf-py"
+                    ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/gen-tiny-qwen35.py ${TINY_QWEN35_DEST})
+        set_tests_properties(test-gen-tiny-qwen35 PROPERTIES FIXTURES_SETUP test-gen-tiny-qwen35)
+        set(RS_RING_MODEL "${TINY_QWEN35_DEST}")
+        set(RS_RING_FIXTURE "test-gen-tiny-qwen35")
+    else()
+        message(STATUS "test-rs-ring-rotation: numpy/gguf not importable; test self-skips on the non-recurrent stories model")
+    endif()
+else()
+    message(STATUS "test-rs-ring-rotation: Python3 not found; test self-skips on the non-recurrent stories model")
+endif()
+# Force CPU (-ngl 0): the ring bit-identity check requires the ring and no-ring
+# contexts to run the identical GDN compute path. On GPU backends without a fused
+# GDN op it falls back per context and diverges; the invariant (and this test) is
+# defined on CPU, per the test header.
+llama_build_and_test(test-rs-ring-rotation.cpp LABEL "model" ARGS -m "${RS_RING_MODEL}" -ngl 0)
+set_tests_properties(test-rs-ring-rotation PROPERTIES FIXTURES_REQUIRED "${RS_RING_FIXTURE}")
+
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
@@ -308,3 +346,23 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# dspark Phase 1 forward-graph gate (Tier 1: synthetic tap features / Tier 2:
+# diff vs the Python reference implementation). Not wired into `ctest` since both
+# tiers need a real dspark GGUF passed on the command line; run manually.
+llama_build(test-dspark-forward.cpp)
+
+# dspark Phase 2 block-draft-loop gate (common_speculative_impl_draft_dspark):
+# diffs several rounds of the real draft loop against a Python
+# reference (scratchpad/dspark_phase2_py_ref.py) driven over an identical
+# synthetic target-feature stand-in. Not wired into `ctest`: needs a tiny
+# synthetic dspark GGUF + the reference JSON passed on the command line (see
+# scratchpad/dspark_build_tiny.py); run manually.
+llama_build(test-dspark-loop.cpp)
+
+# dspark Phase 3 real-target eval harness: drives the real draft/verify/accept
+# loop against a real target + real drafter GGUF to measure accept-rate/
+# tau (there is no CLI/server integration for draft-dspark yet -- see the
+# file's header comment). Not wired into `ctest`: needs real multi-GB GGUFs
+# passed on the command line; run manually on a GPU host.
+llama_build(test-dspark-real-eval.cpp)

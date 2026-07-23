@@ -118,6 +118,18 @@ option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
+option(LLAMA_DSPARK_MARKOV_BLAS "llama-common: use BLAS for dspark Markov resample" OFF)
+
+# Device-side dspark Markov resample. Compiled by default whenever the CUDA
+# backend is built and -- when the drafter actually carries a Markov head -- it
+# is the DEFAULT resample path at runtime. Set LLAMA_DSPARK_MARKOV_CUDA=0 in the
+# environment to fall back to the BLAS/scalar host paths.
+if (GGML_CUDA)
+    set(LLAMA_DSPARK_MARKOV_CUDA_DEFAULT ON)
+else()
+    set(LLAMA_DSPARK_MARKOV_CUDA_DEFAULT OFF)
+endif()
+option(LLAMA_DSPARK_MARKOV_CUDA "llama-common: use CUDA for dspark Markov resample" ${LLAMA_DSPARK_MARKOV_CUDA_DEFAULT})
 
 
 # Required for relocatable CMake package

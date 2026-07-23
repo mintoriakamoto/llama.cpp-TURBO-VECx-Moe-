@@ -81,6 +81,8 @@ add_library(${TARGET}
     imatrix-loader.cpp
     imatrix-loader.h
     json-schema-to-grammar.cpp
+    kv-mean-center.cpp
+    kv-mean-center.h
     llguidance.cpp
     log.cpp
     log.h
@@ -164,6 +166,62 @@ if (LLAMA_LLGUIDANCE)
     target_link_libraries(${TARGET} PRIVATE llguidance)
     if (WIN32)
         target_link_libraries(${TARGET} PRIVATE ws2_32 userenv ntdll bcrypt)
+    endif()
+endif()
+
+if (LLAMA_DSPARK_MARKOV_BLAS)
+    find_package(BLAS REQUIRED)
+
+    if ("${BLAS_INCLUDE_DIRS}" STREQUAL "")
+        find_path(LLAMA_DSPARK_MARKOV_CBLAS_INCLUDE_DIR
+            NAMES cblas.h
+            HINTS
+                /usr/include
+                /usr/local/include
+                /usr/include/openblas
+                /opt/homebrew/opt/openblas/include
+                /usr/local/opt/openblas/include
+                /usr/include/x86_64-linux-gnu/openblas/include
+        )
+        set(BLAS_INCLUDE_DIRS ${LLAMA_DSPARK_MARKOV_CBLAS_INCLUDE_DIR})
+    endif()
+
+    if ("${BLAS_INCLUDE_DIRS}" STREQUAL "")
+        message(FATAL_ERROR "LLAMA_DSPARK_MARKOV_BLAS was enabled but cblas.h could not be found")
+    endif()
+
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_DSPARK_MARKOV_BLAS)
+    target_include_directories(${TARGET} SYSTEM PRIVATE ${BLAS_INCLUDE_DIRS})
+    target_link_libraries(${TARGET} PUBLIC ${BLAS_LIBRARIES})
+endif()
+
+if (LLAMA_DSPARK_MARKOV_CUDA)
+    # The CUDA language and CMAKE_CUDA_ARCHITECTURES are already established by
+    # ggml's CUDA backend build; reuse them for the self-contained resample TU.
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+
+    target_sources(${TARGET} PRIVATE dspark-markov.cu)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_DSPARK_MARKOV_CUDA)
+    target_link_libraries(${TARGET} PRIVATE CUDA::cudart)
+
+    if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        # CMAKE_CUDA_ARCHITECTURES is resolved inside ggml's CUDA backend
+        # subdirectory (auto-detect / GGML_CUDA_ARCHITECTURES) with a plain set(),
+        # so it does not propagate up to this scope. Pinning "80" would build the
+        # resample TU for SM80 only -- forcing a PTX JIT on Hopper/H100 (sm_90) and
+        # failing outright on the pre-Ampere GPUs the rest of ggml still supports.
+        # Inherit the exact architecture list the ggml CUDA backend was built for.
+        if (TARGET ggml-cuda)
+            get_target_property(_dspark_markov_cuda_archs ggml-cuda CUDA_ARCHITECTURES)
+        endif()
+        if (_dspark_markov_cuda_archs)
+            set_target_properties(${TARGET} PROPERTIES CUDA_ARCHITECTURES "${_dspark_markov_cuda_archs}")
+        else()
+            # ggml-cuda target/property unavailable: detect the build machine's GPU
+            # (e.g. sm_90 on H100) rather than defaulting to SM80 only.
+            set_target_properties(${TARGET} PROPERTIES CUDA_ARCHITECTURES "native")
+        endif()
     endif()
 endif()
 

@@ -24,6 +24,9 @@
 #define N_R0_Q1_0 8
 #define N_SG_Q1_0 2
 
+#define N_R0_Q2_0 8
+#define N_SG_Q2_0 2
+
 #define N_R0_Q4_0 4
 #define N_SG_Q4_0 2
 
@@ -101,6 +104,7 @@
 #define FC_SUM_ROWS                    1400
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
+#define FC_GATED_DELTA_NET_WRITE_ROWS  (FC_GATED_DELTA_NET + 4)
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8

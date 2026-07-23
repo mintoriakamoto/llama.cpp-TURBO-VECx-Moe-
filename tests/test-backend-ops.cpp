@@ -3946,16 +3946,21 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted;
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+    const bool    rows_mode; // rows-indexed state read from a 2D cache view (src[6])
+    const int64_t cache_rows; // rows-mode cache row count (-1 => n_seqs + 3)
 
     std::string vars() override {
-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+        return VARS_TO_STR11(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, rows_mode, cache_rows);
     }
+
+    int64_t n_cache_rows() const { return cache_rows > 0 ? cache_rows : n_seqs + 3; }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool rows_mode = false,
+            int64_t cache_rows = -1)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), rows_mode(rows_mode), cache_rows(cache_rows) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -3977,14 +3982,26 @@ struct test_gated_delta_net : public test_case {
         const int64_t g_ne0 = kda ? head_size : 1;
         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, g_ne0, head_count * v_repeat, n_seq_tokens, n_seqs);
         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
-        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
         ggml_set_name(g,     "g");
         ggml_set_name(beta,  "beta");
-        ggml_set_name(state, "state");
         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
-        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        ggml_tensor * out;
+        if (rows_mode) {
+            // 2D cache view with more rows than sequences; per-seq state rows
+            // are picked via the I32 rows tensor (see initialize_tensors)
+            const int64_t D = head_size * v_repeat * head_size * head_count;
+            ggml_tensor * states = ggml_new_tensor_2d(ctx, type, D, n_cache_rows());
+            ggml_tensor * rows   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+            ggml_set_name(states, "state");
+            ggml_set_name(rows,   "rows");
+            out = ggml_gated_delta_net_rows(ctx, q, k, v, g, beta, states, rows, K);
+        } else {
+            ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
+            ggml_set_name(state, "state");
+            out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        }
         return out;
     }
 
@@ -3997,6 +4014,13 @@ struct test_gated_delta_net : public test_case {
                 init_tensor_uniform(t, 0.0f, 1.0f);
             } else if (strcmp(t->name, "v") == 0) {
                 init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "rows") == 0) {
+                // deterministic, distinct, in-range cache rows (stride 2 over n_seqs+3)
+                std::vector<int32_t> idx(t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0]; i++) {
+                    idx[i] = (int32_t) ((i*2 + 1) % n_cache_rows());
+                }
+                ggml_backend_tensor_set(t, idx.data(), 0, idx.size()*sizeof(int32_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -7738,6 +7762,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
+    GGML_TYPE_Q2_0,
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
@@ -7752,6 +7777,7 @@ static const ggml_type base_types[] = {
     GGML_TYPE_F32, GGML_TYPE_F16,
     GGML_TYPE_Q8_0, // for I8MM tests
     GGML_TYPE_Q1_0,
+    GGML_TYPE_Q2_0,
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_1, // for I8MM tests
     GGML_TYPE_Q4_K,
@@ -7764,6 +7790,7 @@ static const ggml_type other_types[] = {
     GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
+    GGML_TYPE_Q2_0,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
@@ -9389,6 +9416,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+    // rows mode: state read directly from a 2D cache view at rows[seq] (src[6])
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   1, 1, 1, false, false, /*K=*/1, /*rows=*/true)); // rows-mode K==1 final-state branch
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   1, 1, 1, false, false, /*K=*/2, /*rows=*/true, /*cache_rows=*/1)); // 1-row cache + K>1: CPU workspace-sizing regression
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   1, 2, 1, false, false, /*K=*/1, /*rows=*/true)); // rows-mode K==1, multi-seq
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   1, 1, 1, false, false, /*K=*/2, /*rows=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, false, /*K=*/4, /*rows=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128,  4, 1, 1, false, false, /*K=*/4, /*rows=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3, /*rows=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4, /*rows=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4, /*rows=*/true));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

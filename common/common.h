@@ -105,6 +105,7 @@ enum llama_example {
     LLAMA_EXAMPLE_RESULTS,
     LLAMA_EXAMPLE_EXPORT_GRAPH_OPS,
     LLAMA_EXAMPLE_DOWNLOAD,
+    LLAMA_EXAMPLE_KV_MEAN_CENTER,
 
     LLAMA_EXAMPLE_COUNT,
 };
@@ -171,6 +172,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // dspark: EAGLE-style block-diffusion drafter
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -385,8 +387,21 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
+        // Both MTP and dspark verify a whole draft block against the target in
+        // one llama_decode(), then crop the target's cache back to the accepted
+        // length with a PARTIAL llama_memory_seq_rm(). On a hybrid GDN/attention
+        // target (e.g. QWEN35/QWEN35MOE) that partial removal only succeeds if
+        // the recurrent-state rollback ring (n_rs_seq) was sized up front --
+        // see llama_memory_recurrent::seq_rm()'s "partial rollback via
+        // per-token snapshot index" path and llm_arch_supports_rs_rollback().
+        // Omitting a block-verify draft type here silently leaves n_rs_seq=0,
+        // so the post-verify crop on ctx_tgt no-ops instead of failing loudly
+        // (llama_memory_hybrid::seq_rm short-circuits to `return false` without
+        // mutating either sub-cache) -- the target's GDN state then keeps
+        // absorbing every future round's rejected draft tail.
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -590,6 +605,10 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+
+    // path to a K-cache mean-centering bias file (GGUF), or empty to disable.
+    // only takes effect when cache_type_k == GGML_TYPE_Q4_0; see docs/kv-mean-center.md
+    std::string kv_mean_center_path = "";
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

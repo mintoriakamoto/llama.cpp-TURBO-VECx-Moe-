@@ -45,6 +45,7 @@ enum llm_arch {
     LLM_ARCH_QWEN3VLMOE,
     LLM_ARCH_QWEN35,
     LLM_ARCH_QWEN35MOE,
+    LLM_ARCH_DSPARK,
     LLM_ARCH_PHI2,
     LLM_ARCH_PHI3,
     LLM_ARCH_PHIMOE,
@@ -204,6 +205,19 @@ enum llm_kv {
     LLM_KV_MOE_EVERY_N_LAYERS,
     LLM_KV_MOE_LATENT_SIZE,
     LLM_KV_NEXTN_PREDICT_LAYERS,
+    // dspark drafter hyperparameters (block-diffusion EAGLE-style drafter)
+    LLM_KV_DSPARK_BLOCK_SIZE,
+    LLM_KV_DSPARK_MASK_TOKEN_ID,
+    LLM_KV_DSPARK_TARGET_LAYERS,
+    LLM_KV_DSPARK_MARKOV_RANK,
+    LLM_KV_DSPARK_CONFIDENCE_HEAD,
+    LLM_KV_DSPARK_CONFIDENCE_WITH_MARKOV,
+    // GIDD log-SNR / noise-level conditioning (present on some drafters).
+    // Optional: absent on drafters not trained with it, which must keep
+    // loading unchanged.
+    LLM_KV_DSPARK_LOG_SNR_CONDITIONING,
+    LLM_KV_DSPARK_MIN_LOG_SNR,
+    LLM_KV_DSPARK_MAX_LOG_SNR,
     LLM_KV_NUM_DEEPSTACK_LAYERS,
     LLM_KV_DEEPSTACK_MAPPING,
     LLM_KV_HIDDEN_ACT,
@@ -611,6 +625,17 @@ enum llm_tensor {
     LLM_TENSOR_MASKED_EMBD_ORDERING,
     LLM_TENSOR_FC,
     LLM_TENSOR_D2T,
+    // dspark drafter tensors. The decoder blocks reuse the standard
+    // LLM_TENSOR_ATTN_* / LLM_TENSOR_FFN_* / LLM_TENSOR_OUTPUT_NORM /
+    // LLM_TENSOR_OUTPUT / LLM_TENSOR_TOKEN_EMBD names; these are the
+    // dspark-specific extras.
+    LLM_TENSOR_DSPARK_FC,              // [n_capture * target_hidden, hidden] feature projection
+    LLM_TENSOR_DSPARK_HIDDEN_NORM,    // RMSNorm after fc
+    LLM_TENSOR_DSPARK_MARKOV_HEAD_A,  // low-rank logit-bias factor A
+    LLM_TENSOR_DSPARK_MARKOV_HEAD_B,  // low-rank logit-bias factor B
+    LLM_TENSOR_DSPARK_CONFIDENCE_HEAD, // accept-rate predictor
+    LLM_TENSOR_DSPARK_LOG_SNR_FC1,     // GIDD log-SNR embed: [n_freq -> hidden]
+    LLM_TENSOR_DSPARK_LOG_SNR_FC2,     // GIDD log-SNR embed: [hidden -> hidden]
 };
 
 

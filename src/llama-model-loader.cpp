@@ -71,6 +71,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ3_M:     name = LLAMA_FTYPE_PREFIX "IQ3_S mix - 3.66 bpw"; break;
         default:                           name = LLAMA_FTYPE_PREFIX "unknown, may not work"; break;
     }
+
     return (ftype & LLAMA_FTYPE_GUESSED) ? name : name + guessed_prefix_len;
 }
 

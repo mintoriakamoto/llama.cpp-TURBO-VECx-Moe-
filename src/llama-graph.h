@@ -84,6 +84,26 @@ struct llama_cross {
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
 };
 
+// dspark drafter: staging for the target-tap context window (EAGLE-style
+// block-diffusion drafter). Modeled directly on llama_cross above: a small POD
+// owned by llama_context, threaded through llm_graph_params as a pointer, and
+// consumed by llm_graph_input_dspark_ctx::set_input(). This exists because the
+// context rows the drafter attends to don't fit llama_batch.token/embd: they
+// have a different width (n_capture_layers * n_embd, i.e. the RAW multi-layer
+// tap concatenation, pre dspark.fc) than the token embedding width, and a
+// different row count than the draft block being predicted.
+struct llama_dspark_ctx {
+    int64_t n_embd_cap = 0; // n_capture_layers * n_embd (raw tap width, pre dspark.fc)
+    int64_t n_ctx_rows = 0; // number of staged context rows for the next decode call
+
+    // [n_ctx_rows * n_embd_cap], row-major: row i is the concatenated multi-layer
+    // tap feature for the i-th staged context row (e.g. from
+    // llama_get_embeddings_capture_ith on the target's context, one row per
+    // accepted-since-last-round token). Row positions come from the decode batch,
+    // not from this staged data.
+    std::vector<float>   v_ctx_feat;
+};
+
 struct llm_graph_params;
 
 //
@@ -146,6 +166,47 @@ public:
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
+};
+
+// dspark drafter: stages the raw multi-layer target-tap context window (see
+// llama_dspark_ctx above). Deliberately NOT an extension of llm_graph_input_embd_h:
+// that struct assumes one batch.embd channel shared between "the" embedding and
+// "the" extra hidden state, both n_embd wide and n_batch tall. dspark needs two
+// independently-sized channels instead (context rows: n_capture*n_embd wide,
+// n_ctx_rows tall; draft-block rows: n_embd wide via the normal token embedding
+// path, n_draft tall) so it gets its own input class carrying just the piece
+// that doesn't fit anywhere else: the raw context feature tensor.
+class llm_graph_input_dspark_ctx : public llm_graph_input_i {
+public:
+    llm_graph_input_dspark_ctx(const llama_dspark_ctx * dctx) : dctx(dctx) {}
+    virtual ~llm_graph_input_dspark_ctx() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * ctx_feat = nullptr; // F32 [n_embd_cap, n_ctx_rows]
+
+    const llama_dspark_ctx * dctx;
+};
+
+// dspark GIDD log-SNR conditioning (LogSnrEmbed): the sinusoidal feature matrix
+// fed into dspark.log_snr_fc1/fc2. Unlike llm_graph_input_dspark_ctx, this
+// carries no external staged state -- the per-position log-SNR pattern (anchor
+// position of each block at max_log_snr, mask positions at min_log_snr) and its
+// sinusoidal featurization are a pure function of n_draft/block_size/min_log_snr/
+// max_log_snr, all known at graph-build time, so the caller precomputes the full
+// [n_freq, n_draft] feature matrix once (graph::graph()) and this class just
+// stages it as an input (ggml's no_alloc graph context means even build-time-
+// constant data has to go through set_input(), same as everything else here).
+class llm_graph_input_dspark_logsnr : public llm_graph_input_i {
+public:
+    llm_graph_input_dspark_logsnr(std::vector<float> feat) : v_feat(std::move(feat)) {}
+    virtual ~llm_graph_input_dspark_logsnr() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * feat = nullptr; // F32 [n_freq, n_draft]
+
+    std::vector<float> v_feat;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -266,6 +327,16 @@ public:
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
+
+    // destination rows for the per-token snapshot writes (rotating ring),
+    // only when n_rs_seq > 0. slot-major, oldest kept snapshot first:
+    // row r*n_seqs + s is the row for snapshot slot r of ubatch seq s
+    // (see llama_memory_recurrent_context::set_input_s_write_rows)
+    ggml_tensor * s_write_rows = nullptr;       // I64 [n_write * n_seqs]
+
+    // same rows in seq-major order (row s*n_write + r), matching the im2col
+    // output row order of the conv-state writer
+    ggml_tensor * s_write_rows_conv = nullptr;  // I64 [n_write * n_seqs]
 
     const llama_memory_recurrent_context * mctx;
 
@@ -683,6 +754,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_dspark_ctx       * dspark_ctx;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -800,6 +872,9 @@ public:
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+    // multi-layer hidden-state tap: the per-layer outputs concatenated along dim0
+    // into a single [n_capture * n_embd, n_outputs] tensor, in capture order.
+    ggml_tensor * get_h_capture()   const { return t_h_capture; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -833,6 +908,9 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    // [n_capture * n_embd, n_outputs] concatenated multi-layer hidden states, set
+    // by the per-model graph builder when cparams.n_capture_layers > 0.
+    ggml_tensor * t_h_capture   = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -923,6 +1001,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_dspark_ctx       * dspark_ctx;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1201,6 +1280,17 @@ struct llm_graph_context {
                 int32_t   state_size,
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+
+    // like build_rs, but WITHOUT the main per-seq state gather: performs the
+    // rs_zero clear and the extra-states relocation, then returns the 2D
+    // (state_size, n_rs_total) cache view. For consumers that read per-seq
+    // state rows directly via inp->s_copy_main (e.g. ggml_gated_delta_net_rows),
+    // saving a get_rows + a downstream slot-0 cpy per layer per decode.
+    ggml_tensor * build_rs_cache_view(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

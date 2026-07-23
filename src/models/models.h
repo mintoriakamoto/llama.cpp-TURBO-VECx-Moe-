@@ -78,6 +78,11 @@ struct llm_build_delta_net_base : public llm_graph_context {
 
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
+    //
+    // state_rows (optional, ring path only): when set, `s` is instead the 2D
+    // cache view from build_rs_cache_view and the fused op reads each seq's
+    // live state directly at cache row state_rows[seq] (inp->s_copy_main) --
+    // no gathered scratch, no slot-0 cpy.
     ggml_tensor * build_recurrent_attn(
             llm_graph_input_rs * inp,
             ggml_tensor *        ssm_states_all,
@@ -87,7 +92,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        g,
             ggml_tensor *        b,
             ggml_tensor *        s,
-            int                  il);
+            int                  il,
+            ggml_tensor *        state_rows = nullptr);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {
@@ -530,6 +536,24 @@ struct llama_model_qwen2moe : public llama_model_base {
 
 struct llama_model_qwen3 : public llama_model_base {
     llama_model_qwen3(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
+// dspark: EAGLE-style block-diffusion speculative-decoding drafter. Trunk is a
+// small dense Qwen3-style stack (standard llama_layer attn_*/ffn_* tensors);
+// the graph is genuinely novel per-layer (target-tap context re-projected fresh
+// through each layer's own k_proj/v_proj, concatenated with the draft block's
+// own K/V) -- see src/models/dspark.cpp.
+struct llama_model_dspark : public llama_model_base {
+    llama_model_dspark(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 

@@ -86,7 +86,14 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                if (n_rs_seq > 0) {
+                    // see llama_memory_recurrent::init_batch() -- the rotating
+                    // snapshot ring removed the same-ubatch snapshot restriction,
+                    // but split_seq() is kept until split_equal() rollback is tested
+                    ubatch = balloc.split_seq(n_ubatch);
+                } else {
+                    ubatch = balloc.split_equal(n_ubatch, !unified, 0);
+                }
             }
 
             if (ubatch.n_tokens == 0) {
